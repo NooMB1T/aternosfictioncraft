@@ -1,508 +1,636 @@
 import asyncio
 import logging
+import json
+import os
+import re
 from datetime import datetime
+from threading import Thread
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.constants import ChatAction
 from flask import Flask
-from threading import Thread
-import aternos
-import traceback
-import random
-import time
 
-# ==================== КОНФИГ ====================
+# ══════════════════════════════════════════════════════════════════
+# КОНФІГ
+# ══════════════════════════════════════════════════════════════════
+
 TELEGRAM_TOKEN = "8932716211:AAEC1-wnXkYWP2n4d2RtdaynBKkEq0H0JNs"
-ATERNOS_USERNAME = "GodB1T"
-ATERNOS_PASSWORD = "AntonGod"
+ATERNOS_USER = "GodB1T"
+ATERNOS_PASS = "AntonGod"
 SERVER_ID = "ZMbbJv4TMQFIbi78"
 LOG_CHAT_ID = -1002221201789
-ADMIN_USER_ID = None  # Можешь указать свой ID для админ команд
+SCOREBOARD_NAME = "Money"
 
-# Логирование
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# Глобальные переменные
-aternos_session = None
+# ══════════════════════════════════════════════════════════════════
+# ГЛОБАЛЬНІ ЗМІННІ
+# ══════════════════════════════════════════════════════════════════
+
+STATS_FILE = "stats.json"
+stats = {
+    "starts": 0,
+    "stops": 0,
+    "last_start": None,
+    "last_stop": None,
+    "uptime_from": None,
+    "peak_players": 0
+}
+
 telegram_app = None
-server_status_cache = {"status": None, "updated": 0}
+session = None
+server_online = False
+current_players = []
 
-# ==================== ATERNOS ФУНКЦИИ ====================
+def load_stats():
+    global stats
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE) as f:
+                stats = json.load(f)
+                log.info(f"✅ Статистика завантажена: {stats['starts']} запусків")
+        except Exception as e:
+            log.error(f"Помилка завантаження stats: {e}")
 
-async def init_aternos():
-    """Инициализация сессии Aternos"""
-    global aternos_session
+def save_stats():
     try:
-        aternos_session = aternos.Client()
-        aternos_session.login(ATERNOS_USERNAME, ATERNOS_PASSWORD)
-        logger.info("✅ Aternos подключен!")
-        return True
+        with open(STATS_FILE, "w") as f:
+            json.dump(stats, f)
     except Exception as e:
-        logger.error(f"❌ Ошибка подключения Aternos: {e}")
-        traceback.print_exc()
+        log.error(f"Помилка збереження stats: {e}")
+
+# ══════════════════════════════════════════════════════════════════
+# ATERNOS API (REQUESTS)
+# ══════════════════════════════════════════════════════════════════
+
+def get_session():
+    """Отримати requests сесію з retry логікою"""
+    global session
+    if session is None:
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+    return session
+
+def aternos_login():
+    """Логін в Aternos через прямий API запит"""
+    global session, server_online, current_players
+    try:
+        s = get_session()
+        
+        # Крок 1: Отримуємо токен сесії
+        log.info("🔑 Логінимось в Aternos...")
+        login_url = "https://aternos.org/panel/ajax/account/login.php"
+        
+        login_data = {
+            "user": ATERNOS_USER,
+            "password": ATERNOS_PASS
+        }
+        
+        resp = s.post(login_url, data=login_data, timeout=10)
+        if resp.status_code != 200:
+            log.error(f"❌ Помилка логіну: {resp.status_code}")
+            return False
+        
+        log.info("✅ Aternos логін успішний!")
+        
+        # Крок 2: Отримуємо статус сервера
+        try:
+            server_online = check_server_status()
+            current_players = get_players_list()
+            log.info(f"✅ Статус сервера: {'🟢 ОНЛАЙН' if server_online else '🔴 ОФФЛАЙН'}")
+            log.info(f"✅ Гравців онлайн: {len(current_players)}")
+        except Exception as e:
+            log.warning(f"⚠️ Не вдалось отримати статус: {e}")
+        
+        return True
+        
+    except Exception as e:
+        log.error(f"❌ Помилка логіну Aternos: {e}")
         return False
 
-async def get_server():
-    """Получить сервер"""
+def check_server_status():
+    """Перевірити статус сервера"""
     try:
-        if not aternos_session:
-            await init_aternos()
-        server = aternos_session.get_server(SERVER_ID)
-        return server
+        s = get_session()
+        url = f"https://aternos.org/api/server/{SERVER_ID}"
+        resp = s.get(url, timeout=10)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            status = data.get("status", "offline")
+            return status == "online"
+        return False
     except Exception as e:
-        logger.error(f"❌ Ошибка получения сервера: {e}")
-        return None
+        log.warning(f"⚠️ Помилка перевірки статусу: {e}")
+        return False
 
-async def send_log(message: str, parse_mode="HTML"):
-    """Отправить лог в чат"""
+def get_players_list():
+    """Отримати список гравців онлайн"""
     try:
-        if telegram_app:
-            await telegram_app.bot.send_message(
-                chat_id=LOG_CHAT_ID, 
-                text=message,
-                parse_mode=parse_mode
-            )
-            logger.info(f"📝 Лог отправлен")
+        s = get_session()
+        url = f"https://aternos.org/api/server/{SERVER_ID}/players"
+        resp = s.get(url, timeout=10)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            players = data.get("players", [])
+            return players
+        return []
     except Exception as e:
-        logger.error(f"❌ Ошибка отправки лога: {e}")
+        log.warning(f"⚠️ Помилка отримання гравців: {e}")
+        return []
 
-def get_status_emoji(status):
-    """Получить эмодзи статуса"""
-    if status == "online":
-        return "🟢"
-    elif status == "offline":
-        return "🔴"
-    elif status in ["loading", "starting"]:
-        return "🟡"
-    else:
-        return "⚫"
+def start_server():
+    """Включити сервер"""
+    try:
+        s = get_session()
+        url = f"https://aternos.org/api/server/{SERVER_ID}/start"
+        resp = s.post(url, timeout=30)
+        
+        if resp.status_code in [200, 201]:
+            log.info("✅ Команда запуску відправлена")
+            return True
+        log.warning(f"⚠️ Статус відповіді: {resp.status_code}")
+        return False
+    except Exception as e:
+        log.error(f"❌ Помилка запуску: {e}")
+        return False
 
-# ==================== TELEGRAM КОМАНДЫ ====================
+def stop_server():
+    """Вимкнути сервер"""
+    try:
+        s = get_session()
+        url = f"https://aternos.org/api/server/{SERVER_ID}/stop"
+        resp = s.post(url, timeout=30)
+        
+        if resp.status_code in [200, 201]:
+            log.info("✅ Команда вимкнення відправлена")
+            return True
+        log.warning(f"⚠️ Статус відповіді: {resp.status_code}")
+        return False
+    except Exception as e:
+        log.error(f"❌ Помилка вимкнення: {e}")
+        return False
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start - главное меню"""
-    await update.message.chat.send_action(ChatAction.TYPING)
-    
-    keyboard = [
-        [
-            InlineKeyboardButton("🟢 ВКЛЮЧИТЬ", callback_data="cmd_on"),
-            InlineKeyboardButton("🔴 ВЫКЛЮЧИТЬ", callback_data="cmd_off"),
-        ],
-        [
-            InlineKeyboardButton("👥 ИГРОКИ", callback_data="cmd_players"),
-        ],
-        [
-            InlineKeyboardButton("📊 СТАТУС", callback_data="cmd_status"),
-            InlineKeyboardButton("🎮 ПРИКОЛЫ", callback_data="cmd_menu"),
-        ],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    welcome_text = (
-        "<b>🎮 ATERNOS BOT - fictionmine 🎮</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>Привет! Я твой помощник для управления сервером.</b>\n\n"
-        "Доступные команды:\n"
-        "• <code>/on</code> - Включить сервер\n"
-        "• <code>/off</code> - Выключить сервер\n"
-        "• <code>/players</code> - Список игроков\n"
-        "• <code>/status</code> - Статус сервера\n"
-        "• <code>/menu</code> - Приколы\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<i>Или просто нажми кнопку ниже!</i>"
+# ══════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+async def send_log(text: str):
+    """Відправити в лог-чат"""
+    if telegram_app:
+        try:
+            await telegram_app.bot.send_message(LOG_CHAT_ID, text, parse_mode="HTML")
+        except Exception as e:
+            log.error(f"send_log error: {e}")
+
+def get_msg(update: Update):
+    """Отримати повідомлення (команда або кнопка)"""
+    if update.callback_query:
+        return update.callback_query.message
+    return update.message
+
+async def typing(update: Update):
+    """Показати "печатает""""
+    try:
+        await get_msg(update).chat.send_action(ChatAction.TYPING)
+    except:
+        pass
+
+def status_emoji(online):
+    return "🟢" if online else "🔴"
+
+# ══════════════════════════════════════════════════════════════════
+# КНОПКИ
+# ══════════════════════════════════════════════════════════════════
+
+MAIN_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🟢 ВКЛЮЧИТИ", callback_data="on"),
+     InlineKeyboardButton("🔴 ВИМКНУТИ", callback_data="off")],
+    [InlineKeyboardButton("👥 ГРАВЦІ", callback_data="players")],
+    [InlineKeyboardButton("📊 ІНФО", callback_data="menu"),
+     InlineKeyboardButton("⚙️ СТАТУС", callback_data="status")],
+    [InlineKeyboardButton("💰 СКОРБОРД", callback_data="scoreboard")],
+])
+
+# ══════════════════════════════════════════════════════════════════
+# КОМАНДИ
+# ══════════════════════════════════════════════════════════════════
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда /start"""
+    await typing(update)
+    text = (
+        "<b>🎮 ATERNOS BOT — fictionmine</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "• /on — включити сервер\n"
+        "• /off — вимкнути сервер\n"
+        "• /players — гравці онлайн\n"
+        "• /status — статус\n"
+        "• /info — інфо + статистика\n"
+        "• /scoreboard — скорборд гравців\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Або натисни кнопку 👇</i>"
     )
+    await get_msg(update).reply_text(text, reply_markup=MAIN_KB, parse_mode="HTML")
+
+async def cmd_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Включити сервер"""
+    global server_online, stats
+    await typing(update)
+    msg = await get_msg(update).reply_text("<b>⏳ Запускаю сервер...</b>", parse_mode="HTML")
     
-    await update.message.reply_text(
-        welcome_text,
-        reply_markup=reply_markup,
+    try:
+        # Перевіряємо перед запуском
+        server_online = check_server_status()
+        
+        if server_online:
+            return await msg.edit_text(
+                "✅ <b>Сервер вже включений!</b>",
+                parse_mode="HTML"
+            )
+        
+        # Запускаємо
+        ok = await asyncio.to_thread(start_server)
+        
+        if not ok:
+            return await msg.edit_text(
+                "❌ <b>Не вдалось запустити сервер</b>\n"
+                "<i>Спробуй через 30 секунд</i>",
+                parse_mode="HTML"
+            )
+        
+        stats["starts"] += 1
+        stats["last_start"] = datetime.now().isoformat()
+        stats["uptime_from"] = datetime.now().isoformat()
+        save_stats()
+        server_online = True
+        
+        await msg.edit_text(
+            "🟢 <b>СЕРВЕР ЗАПУЩЕНО!</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏰ <b>Час:</b> {datetime.now().strftime('%H:%M:%S')}\n"
+            f"🎮 <b>Сервер:</b> fictionmine\n"
+            f"📊 <b>Запусків:</b> {stats['starts']}\n"
+            "<i>Завантаження 5-10 хв...</i>",
+            parse_mode="HTML"
+        )
+        
+        await send_log(
+            f"🟢 <b>СЕРВЕР ЗАПУЩЕНО!</b>\n"
+            f"⏰ {datetime.now().strftime('%H:%M:%S')}\n"
+            f"📊 Всього запусків: {stats['starts']}"
+        )
+        
+    except Exception as e:
+        await msg.edit_text(f"❌ <b>Помилка:</b>\n<code>{str(e)[:200]}</code>", parse_mode="HTML")
+
+async def cmd_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Вимкнути сервер"""
+    global server_online, stats
+    await typing(update)
+    msg = await get_msg(update).reply_text("<b>⏳ Вимикаю сервер...</b>", parse_mode="HTML")
+    
+    try:
+        server_online = check_server_status()
+        
+        if not server_online:
+            return await msg.edit_text(
+                "🔴 <b>Сервер вже вимкнений!</b>",
+                parse_mode="HTML"
+            )
+        
+        ok = await asyncio.to_thread(stop_server)
+        
+        if not ok:
+            return await msg.edit_text(
+                "❌ <b>Не вдалось вимкнути сервер</b>",
+                parse_mode="HTML"
+            )
+        
+        stats["stops"] += 1
+        stats["last_stop"] = datetime.now().isoformat()
+        stats["uptime_from"] = None
+        save_stats()
+        server_online = False
+        
+        await msg.edit_text(
+            "🔴 <b>СЕРВЕР ВИМКНЕНО!</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏰ <b>Час:</b> {datetime.now().strftime('%H:%M:%S')}",
+            parse_mode="HTML"
+        )
+        
+        await send_log(f"🔴 <b>СЕРВЕР ВИМКНЕНО!</b>\n⏰ {datetime.now().strftime('%H:%M:%S')}")
+        
+    except Exception as e:
+        await msg.edit_text(f"❌ <b>Помилка:</b>\n<code>{str(e)[:200]}</code>", parse_mode="HTML")
+
+async def cmd_players(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Список гравців"""
+    global current_players, server_online
+    await typing(update)
+    msg = await get_msg(update).reply_text("<b>⏳ Перевіряю гравців...</b>", parse_mode="HTML")
+    
+    try:
+        server_online = check_server_status()
+        
+        if not server_online:
+            return await msg.edit_text(
+                "🔴 <b>Сервер оффлайн</b>\n"
+                "<i>Включи командою /on</i>",
+                parse_mode="HTML"
+            )
+        
+        current_players = await asyncio.to_thread(get_players_list)
+        
+        if not current_players:
+            return await msg.edit_text(
+                "👥 <b>ОНЛАЙН: 0 гравців</b>\n\n"
+                "Сервер включений, але нікого немає 😿",
+                parse_mode="HTML"
+            )
+        
+        if len(current_players) > stats["peak_players"]:
+            stats["peak_players"] = len(current_players)
+            save_stats()
+        
+        pl_str = "\n".join(f"  • <b>{p}</b>" for p in current_players)
+        await msg.edit_text(
+            f"👥 <b>ОНЛАЙН: {len(current_players)} гравець(ів)</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n{pl_str}\n━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        await msg.edit_text(f"❌ <b>Помилка:</b>\n<code>{str(e)[:200]}</code>", parse_mode="HTML")
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Статус сервера"""
+    global server_online
+    await typing(update)
+    msg = await get_msg(update).reply_text("<b>⏳ Перевіряю статус...</b>", parse_mode="HTML")
+    
+    try:
+        server_online = check_server_status()
+        
+        await msg.edit_text(
+            f"{status_emoji(server_online)} <b>СТАТУС СЕРВЕРА</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎮 <b>Ім'я:</b> fictionmine (Bedrock)\n"
+            f"📍 <b>Статус:</b> {'🟢 ОНЛАЙН' if server_online else '🔴 ОФФЛАЙН'}\n"
+            f"⏰ <b>Перевірено:</b> {datetime.now().strftime('%H:%M:%S')}\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ <b>Помилка:</b>\n<code>{str(e)[:200]}</code>", parse_mode="HTML")
+
+async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Інформаційне меню"""
+    global server_online, current_players, stats
+    await typing(update)
+    msg = await get_msg(update).reply_text("<b>⏳ Завантажую дані...</b>", parse_mode="HTML")
+    
+    try:
+        server_online = check_server_status()
+        if server_online:
+            current_players = await asyncio.to_thread(get_players_list)
+        
+        last_start = (
+            datetime.fromisoformat(stats["last_start"]).strftime('%d.%m %H:%M')
+            if stats["last_start"] else "Ніколи"
+        )
+        last_stop = (
+            datetime.fromisoformat(stats["last_stop"]).strftime('%d.%m %H:%M')
+            if stats["last_stop"] else "Ніколи"
+        )
+        
+        uptime = "Невідомо"
+        if stats["uptime_from"] and server_online:
+            td = datetime.now() - datetime.fromisoformat(stats["uptime_from"])
+            h, m = td.seconds // 3600, (td.seconds % 3600) // 60
+            uptime = f"{h}г {m}хв"
+        
+        await msg.edit_text(
+            "<b>📊 ІНФОРМАЦІЙНЕ МЕНЮ</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>🎮 СЕРВЕР:</b>\n"
+            f"  Ім'я: fictionmine (Bedrock)\n"
+            f"  Статус: {status_emoji(server_online)} {'🟢 ОНЛАЙН' if server_online else '🔴 ОФФЛАЙН'}\n"
+            f"  Гравців: {len(current_players)}\n\n"
+            "<b>📈 СТАТИСТИКА:</b>\n"
+            f"  Запусків: {stats['starts']}\n"
+            f"  Виключень: {stats['stops']}\n"
+            f"  Пік гравців: {stats['peak_players']}\n"
+            f"  Час роботи: {uptime}\n\n"
+            "<b>⏰ ОСТАННІ ПОДІЇ:</b>\n"
+            f"  Запуск: {last_start}\n"
+            f"  Виключення: {last_stop}\n"
+            "━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ <b>Помилка:</b>\n<code>{str(e)[:200]}</code>", parse_mode="HTML")
+
+async def cmd_scoreboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Скорборд гравців"""
+    global server_online
+    await typing(update)
+    msg = await get_msg(update).reply_text(
+        f"⏳ <b>Завантажую скорборд...</b>",
         parse_mode="HTML"
     )
-
-async def cmd_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /on - включить сервер"""
+    
     try:
-        if hasattr(update, 'callback_query') and update.callback_query:
-            msg = update.callback_query.message
-            await msg.edit_text(
-                "<b>⏳ Запускаю сервер...</b>\n\n"
-                "<i>Это может занять некоторое время...</i>",
-                parse_mode="HTML"
-            )
-        else:
-            msg = await update.message.reply_text(
-                "<b>⏳ Запускаю сервер...</b>\n\n"
-                "<i>Это может занять некоторое время...</i>",
+        server_online = check_server_status()
+        
+        if not server_online:
+            return await msg.edit_text(
+                f"🔴 <b>Сервер оффлайн</b>\n"
+                "<i>Скорборд доступний тільки коли сервер включений</i>",
                 parse_mode="HTML"
             )
         
-        server = await get_server()
-        if not server:
-            await msg.edit_text(
-                "❌ <b>Ошибка подключения</b>\n\n"
-                "Не удалось подключиться к серверу Aternos.\n"
-                "Проверь интернет и попробуй снова.",
-                parse_mode="HTML"
-            )
-            return
-        
-        status = server.status
-        
-        if status == "online":
-            await msg.edit_text(
-                "✅ <b>Сервер уже включен!</b>\n\n"
-                "<i>Игроки уже могут подключаться...</i>",
-                parse_mode="HTML"
-            )
-            return
-        
-        # Запускаем сервер
-        await asyncio.to_thread(server.start)
-        
+        # На жаль Aternos API не дозволяє прочитати скорборд напряму
+        # Показуємо інструкцію
         await msg.edit_text(
-            "🟢 <b>СЕРВЕР ЗАПУЩЕН!</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}\n"
-            f"🎮 <b>Сервер:</b> fictionmine\n"
-            "📝 <b>Статус:</b> Загружается...\n\n"
-            "<i>Подожди 5-10 минут, сервер загружается</i>",
+            f"💰 <b>СКОРБОРД: {SCOREBOARD_NAME}</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ Aternos API не дозволяє прочитати скорборд автоматично.\n\n"
+            f"<b>Як подивитись:</b>\n"
+            f"1. Увійди на сервер\n"
+            f"2. Відкрий сторону табуляції (Tab)\n"
+            f"3. Побачиш гравців і їх баланс\n\n"
+            f"Або введи в чаті:\n"
+            f"<code>/scoreboard players list</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
             parse_mode="HTML"
         )
         
-        log_msg = (
-            f"<b>🟢 СЕРВЕР ЗАПУЩЕН!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n"
-            f"🎮 Сервер: fictionmine\n"
-            f"📝 Статус: Запуск инициирован\n"
-            f"👤 Автор: NooMBOT"
-        )
-        await send_log(log_msg)
-        
     except Exception as e:
-        logger.error(f"❌ Ошибка в /on: {e}\n{traceback.format_exc()}")
-        error_text = f"❌ <b>Ошибка при запуске:</b>\n\n<code>{str(e)[:200]}</code>"
-        if hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.message.edit_text(error_text, parse_mode="HTML")
-        else:
-            await update.message.reply_text(error_text, parse_mode="HTML")
+        await msg.edit_text(f"❌ <b>Помилка:</b>\n<code>{str(e)[:200]}</code>", parse_mode="HTML")
 
-async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /off - выключить сервер"""
-    try:
-        if hasattr(update, 'callback_query') and update.callback_query:
-            msg = update.callback_query.message
-            await msg.edit_text(
-                "<b>⏳ Выключаю сервер...</b>",
-                parse_mode="HTML"
-            )
-        else:
-            msg = await update.message.reply_text(
-                "<b>⏳ Выключаю сервер...</b>",
-                parse_mode="HTML"
-            )
-        
-        server = await get_server()
-        if not server:
-            await msg.edit_text(
-                "❌ <b>Ошибка подключения</b>",
-                parse_mode="HTML"
-            )
-            return
-        
-        if server.status == "offline":
-            await msg.edit_text(
-                "🔴 <b>Сервер уже выключен!</b>",
-                parse_mode="HTML"
-            )
-            return
-        
-        await asyncio.to_thread(server.stop)
-        
-        await msg.edit_text(
-            "🔴 <b>СЕРВЕР ВЫКЛЮЧЕН!</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}\n"
-            f"🎮 <b>Сервер:</b> fictionmine\n"
-            "📝 <b>Статус:</b> Выключен",
-            parse_mode="HTML"
-        )
-        
-        log_msg = (
-            f"<b>🔴 СЕРВЕР ВЫКЛЮЧЕН!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n"
-            f"🎮 Сервер: fictionmine"
-        )
-        await send_log(log_msg)
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка в /off: {e}")
-        error_text = f"❌ <b>Ошибка при выключении:</b>\n\n<code>{str(e)[:200]}</code>"
-        if hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.message.edit_text(error_text, parse_mode="HTML")
-        else:
-            await update.message.reply_text(error_text, parse_mode="HTML")
+# ══════════════════════════════════════════════════════════════════
+# ФОНОВИЙ ЧЕК (кожні 10 хвилин)
+# ══════════════════════════════════════════════════════════════════
 
-async def cmd_players(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /players - список игроков"""
-    try:
-        if hasattr(update, 'callback_query') and update.callback_query:
-            msg = update.callback_query.message
-            await msg.edit_text(
-                "<b>⏳ Проверяю игроков...</b>",
-                parse_mode="HTML"
-            )
-        else:
-            msg = await update.message.reply_text(
-                "<b>⏳ Проверяю игроков...</b>",
-                parse_mode="HTML"
-            )
-        
-        server = await get_server()
-        if not server:
-            await msg.edit_text(
-                "❌ <b>Ошибка подключения</b>",
-                parse_mode="HTML"
-            )
-            return
-        
-        status = server.status
-        
-        if status != "online":
-            status_emoji = get_status_emoji(status)
-            await msg.edit_text(
-                f"{status_emoji} <b>Сервер оффлайн</b>\n\n"
-                f"Статус: {status.upper()}\n"
-                f"<i>Включи сервер командой /on</i>",
-                parse_mode="HTML"
-            )
-            return
+async def background_check():
+    """Кожні 10 хвилин відправляє звіт якщо сервер онлайн"""
+    await asyncio.sleep(10)  # Чекаємо щоб бот запустився
+    
+    while True:
+        await asyncio.sleep(600)  # 10 хвилин
         
         try:
-            players_list = server.players
+            online = await asyncio.to_thread(check_server_status)
+            if not online:
+                continue
             
-            if not players_list or len(players_list) == 0:
-                players_text = (
-                    "👥 <b>ОНЛАЙН: 0 игроков</b>\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    "Сервер включен, но никого нет 😿"
-                )
-            else:
-                players_str = "\n".join([f"  • {p}" for p in players_list])
-                players_text = (
-                    f"👥 <b>ОНЛАЙН: {len(players_list)} игрок(ов)</b>\n\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"{players_str}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━"
-                )
+            players = await asyncio.to_thread(get_players_list)
             
-            await msg.edit_text(players_text, parse_mode="HTML")
+            uptime_str = ""
+            if stats["uptime_from"]:
+                td = datetime.now() - datetime.fromisoformat(stats["uptime_from"])
+                h, m = td.seconds // 3600, (td.seconds % 3600) // 60
+                uptime_str = f"⏱ <b>Час роботи:</b> {h}г {m}хв\n"
             
+            pl_str = (
+                "\n".join(f"  • {p}" for p in players)
+                if players else "  (нікого немає)"
+            )
+            
+            await send_log(
+                f"🟢 <b>СЕРВЕР ОНЛАЙН</b> — авто-звіт\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}\n"
+                f"{uptime_str}"
+                f"👥 <b>Гравці ({len(players)}):</b>\n{pl_str}"
+            )
         except Exception as e:
-            logger.error(f"Ошибка получения игроков: {e}")
-            await msg.edit_text(
-                "⚠️ <b>Не удалось получить список игроков</b>\n\n"
-                "<i>Сервер может еще загружаться...</i>",
-                parse_mode="HTML"
-            )
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка в /players: {e}\n{traceback.format_exc()}")
-        error_text = f"❌ <b>Ошибка:</b>\n\n<code>{str(e)[:200]}</code>"
-        if hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.message.edit_text(error_text, parse_mode="HTML")
-        else:
-            await update.message.reply_text(error_text, parse_mode="HTML")
+            log.error(f"background_check error: {e}")
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /status - статус сервера"""
-    try:
-        if hasattr(update, 'callback_query') and update.callback_query:
-            msg = update.callback_query.message
-            await msg.edit_text(
-                "<b>⏳ Проверяю статус...</b>",
-                parse_mode="HTML"
-            )
-        else:
-            msg = await update.message.reply_text(
-                "<b>⏳ Проверяю статус...</b>",
-                parse_mode="HTML"
-            )
-        
-        server = await get_server()
-        if not server:
-            await msg.edit_text(
-                "❌ <b>Ошибка подключения</b>",
-                parse_mode="HTML"
-            )
-            return
-        
-        status_emoji = get_status_emoji(server.status)
-        status_text_long = server.status.upper()
-        
-        status_msg = (
-            f"{status_emoji} <b>СТАТУС СЕРВЕРА</b>\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎮 <b>Имя:</b> fictionmine\n"
-            f"📍 <b>Статус:</b> {status_text_long}\n"
-            f"🔗 <b>ID:</b> {SERVER_ID[:8]}...\n"
-            f"⏰ <b>Проверено:</b> {datetime.now().strftime('%H:%M:%S')}\n"
-            f"━━━━━━━━━━━━━━━━━━━━"
-        )
-        
-        await msg.edit_text(status_msg, parse_mode="HTML")
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка в /status: {e}")
-        error_text = f"❌ <b>Ошибка:</b>\n\n<code>{str(e)[:200]}</code>"
-        if hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.message.edit_text(error_text, parse_mode="HTML")
-        else:
-            await update.message.reply_text(error_text, parse_mode="HTML")
+# ══════════════════════════════════════════════════════════════════
+# CALLBACK КНОПКИ
+# ══════════════════════════════════════════════════════════════════
 
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /menu - меню приколов"""
-    jokes = [
-        "🎮 Попробуй крафтить Нозерайта в Creative режиме\n(Спойлер: не получится, это Bedrock!)",
-        "😂 Зачем нужен паспорт в Майнкрафте?\nЧтобы пересечь границу Nether'а без виз!",
-        "💎 Почему алмазы в Bedrock дороже чем в Java?\nПотому что тут они на консолях!",
-        "🔥 Что сказал крипер ползунку?\n'Ты мне не нужна, я сам себя взорву!'",
-        "🎯 Как назвать ендермена?\nОтвет: 'Черный ящик' - потому что ты не знаешь, что он там делает",
-        "⚔️ Почему зомби не играют в шахматы?\nПотому что они всегда падают в ямы!",
-        "🌙 Что делает Стив в Bedrock?\nФлексит своими очками!",
-        "🚀 Как быстро добраться до конца?\nОтвет: очень медленно, если ты как я и не знаешь маршрут!",
-        "💀 Почему скелеты - лучшие лучники?\nПотому что у них нет сердца для сомнений!",
-        "🎪 Знаешь, почему сервер Bedrock называется 'fictionmine'?\nПотому что это вымышленный мир... ИЛИ ЭТО?\n🤔",
-        "🔴 Что общего между Крипером и твоим кодом?\nОба взрываются на неожиданных входных данных!",
-        "💻 Почему программист предпочитает Bedrock Java?\nПотому что в Bedrock меньше версионных конфликтов! (Шутка)",
-        "🌍 Как создать идеальный Minecraft сервер?\nШаг 1: Сделай его\nШаг 2: Жди когда он упадет\nШаг 3: Винь Mojang",
-        "🎮 Что сказал Стив Алекс?\n'Ты видела мою кровать?'\nАлекс: 'Да, ты ее 100 раз переносил!'",
-        "⛏️ Почему майнер не может быть грустным?\nПотому что он всегда добывает радость!",
-    ]
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обробка кнопок"""
+    q = update.callback_query
+    await q.answer()
     
-    joke = random.choice(jokes)
-    joke_msg = (
-        "<b>🤣 ВОТ ТЕБЕ ПРИКОЛЕЦ!</b>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{joke}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
-    )
+    handlers = {
+        "on": cmd_on,
+        "off": cmd_off,
+        "players": cmd_players,
+        "status": cmd_status,
+        "menu": cmd_info,
+        "scoreboard": cmd_scoreboard,
+    }
     
-    if hasattr(update, 'callback_query') and update.callback_query:
-        await update.callback_query.message.edit_text(joke_msg, parse_mode="HTML")
-    else:
-        await update.message.reply_text(joke_msg, parse_mode="HTML")
+    fn = handlers.get(q.data)
+    if fn:
+        await fn(update, ctx)
 
-# ==================== CALLBACK BUTTONS ====================
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка кнопок"""
-    query = update.callback_query
-    await query.answer()
-    
-    # Добавляем атрибут callback_query в update для наших функций
-    if query.data == "cmd_on":
-        update.callback_query = query
-        await cmd_on(update, context)
-    elif query.data == "cmd_off":
-        update.callback_query = query
-        await cmd_off(update, context)
-    elif query.data == "cmd_players":
-        update.callback_query = query
-        await cmd_players(update, context)
-    elif query.data == "cmd_menu":
-        update.callback_query = query
-        await cmd_menu(update, context)
-    elif query.data == "cmd_status":
-        update.callback_query = query
-        await cmd_status(update, context)
-
-# ==================== FLASK ДЛЯ REPLIT ====================
+# ══════════════════════════════════════════════════════════════════
+# FLASK (для Render)
+# ══════════════════════════════════════════════════════════════════
 
 flask_app = Flask(__name__)
 
-@flask_app.route('/')
+@flask_app.route("/")
 def home():
-    return '✅ <b>ATERNOS BOT WORK!</b>', 200
+    return "✅ Bot is running!", 200
 
-@flask_app.route('/ping')
+@flask_app.route("/ping")
 def ping():
-    return '🏓 pong', 200
+    return "pong", 200
 
-@flask_app.route('/health')
+@flask_app.route("/health")
 def health():
     return {
-        'status': 'ok',
-        'time': datetime.now().isoformat(),
-        'server': 'fictionmine',
-        'bot': 'aternos_bot'
+        "status": "ok",
+        "server": "🟢 ОНЛАЙН" if server_online else "🔴 ОФФЛАЙН",
+        "time": datetime.now().isoformat(),
+        "starts": stats["starts"]
     }, 200
 
 def run_flask():
-    """Запуск Flask в отдельном потоке"""
-    flask_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    port = int(os.environ.get("PORT", 5000))
+    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# ==================== ОСНОВНОЙ БОТ ====================
+# ══════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════
 
 async def run_bot():
-    """Запуск Telegram бота"""
-    global telegram_app, aternos_session
+    global telegram_app
     
-    logger.info("=" * 60)
-    logger.info("🚀 ЗАПУСК ATERNOS BOT")
-    logger.info("=" * 60)
+    log.info("═══════════════════════════════════════════════════════")
+    log.info("🎮 ATERNOS BOT v3.0 — RENDER")
+    log.info("═══════════════════════════════════════════════════════")
     
-    # Инициализируем Aternos
-    await init_aternos()
+    load_stats()
     
-    # Создаем приложение Telegram
+    # Логін в Aternos
+    log.info("🔑 Логінюсь в Aternos...")
+    ok = await asyncio.to_thread(aternos_login)
+    
+    if not ok:
+        log.error("❌ Не вдалось залогіниться в Aternos!")
+        log.error("Перевір username/password!")
+    
+    # Телеграм бот
     telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Добавляем обработчики команд
-    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("on", cmd_on))
     telegram_app.add_handler(CommandHandler("off", cmd_off))
     telegram_app.add_handler(CommandHandler("players", cmd_players))
-    telegram_app.add_handler(CommandHandler("menu", cmd_menu))
     telegram_app.add_handler(CommandHandler("status", cmd_status))
+    telegram_app.add_handler(CommandHandler("info", cmd_info))
+    telegram_app.add_handler(CommandHandler("menu", cmd_info))
+    telegram_app.add_handler(CommandHandler("scoreboard", cmd_scoreboard))
+    telegram_app.add_handler(CallbackQueryHandler(on_button))
     
-    # Обработчик кнопок
-    telegram_app.add_handler(CallbackQueryHandler(button_callback))
+    log.info("✅ Телеграм бот ініціалізований!")
+    log.info("═══════════════════════════════════════════════════════")
     
-    logger.info("✅ Бот инициализирован!")
-    logger.info("=" * 60)
+    # Запускаємо фоновий чек
+    asyncio.create_task(background_check())
     
-    # Запускаем бот
     await telegram_app.initialize()
     await telegram_app.start()
     await telegram_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
-# ==================== ТОЧКА ВХОДА ====================
+# ══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    logger.info("=" * 60)
-    logger.info("🎮 FICTIONMINE ATERNOS BOT")
-    logger.info("=" * 60)
-    logger.info(f"📝 Username: {ATERNOS_USERNAME}")
-    logger.info(f"🎯 Server ID: {SERVER_ID}")
-    logger.info(f"💬 Log Chat ID: {LOG_CHAT_ID}")
-    logger.info("=" * 60)
+    # Flask в окремому потоці
+    Thread(target=run_flask, daemon=True).start()
+    log.info("✅ Flask запущений на порту 5000")
     
-    # Запускаем Flask в отдельном потоке (для Replit)
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("✅ Flask сервер запущен на port 5000")
-    logger.info("=" * 60)
-    
-    # Запускаем Telegram бота
     try:
         asyncio.run(run_bot())
     except KeyboardInterrupt:
-        logger.info("⛔ Бот остановлен")
+        log.info("⛔ Бот зупинено")
     except Exception as e:
-        logger.error(f"❌ Критическая ошибка: {e}")
-        traceback.print_exc()
+        log.error(f"❌ Критична помилка: {e}", exc_info=True)
