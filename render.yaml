@@ -2,6 +2,7 @@ services:
   - type: web
     name: aternos-bot
     env: python
+    pythonVersion: 3.11
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
@@ -14,8 +15,6 @@ services:
       - key: SERVER_ID
         value: ZMbbJv4TMQFIbi78
       - key: LOG_CHAT_ID
-        value: -1002221201789
-      - key: SCOREBOARD_NAME
-        value: Money
+        value: "-1002221201789"
       - key: PORT
-        value: 5000
+        value: "5000"
