@@ -2,9 +2,9 @@ services:
   - type: web
     name: aternos-bot
     env: python
-    pythonVersion: 3.11
+    pythonVersion: 3.11.0
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python3 bot.py
     envVars:
       - key: TELEGRAM_TOKEN
         value: 8932716211:AAEC1-wnXkYWP2n4d2RtdaynBKkEq0H0JNs
