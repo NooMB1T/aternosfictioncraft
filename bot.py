@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-ATERNOS TELEGRAM BOT
-Бот для управления Minecraft Bedrock сервером на Aternos
-Версия: 6.0 FINAL
+ATERNOS TELEGRAM BOT v8.0 — RAILWAY EDITION
+Управління Minecraft Bedrock сервером на Aternos
+Оптимізований для Railway.app (512MB RAM, 8 годин/день)
 """
 
 import os
@@ -12,8 +12,10 @@ import asyncio
 import logging
 from datetime import datetime
 from threading import Thread
-
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from flask import Flask, jsonify
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,15 +23,15 @@ from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQuer
 from telegram.constants import ChatAction
 
 # ══════════════════════════════════════════════════════════════════
-# КОНФИГ
+# КОНФІГ
 # ══════════════════════════════════════════════════════════════════
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ATERNOS_USER = os.getenv("ATERNOS_USER", "")
 ATERNOS_PASS = os.getenv("ATERNOS_PASS", "")
 SERVER_ID = os.getenv("SERVER_ID", "")
-LOG_CHAT_ID = os.getenv("LOG_CHAT_ID", "0")
-PORT = int(os.getenv("PORT", "10000"))
+LOG_CHAT_ID_RAW = os.getenv("LOG_CHAT_ID", "0")
+PORT = int(os.getenv("PORT", "5000"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,46 +40,48 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-# Проверка конфига
 if not TELEGRAM_TOKEN:
-    log.error("❌ TELEGRAM_TOKEN не установлен! Бот не может запуститься.")
+    log.error("❌ TELEGRAM_TOKEN не встановлено!")
     sys.exit(1)
 
 try:
-    LOG_CHAT_ID = int(LOG_CHAT_ID)
-except:
+    LOG_CHAT_ID = int(LOG_CHAT_ID_RAW)
+except Exception:
     LOG_CHAT_ID = 0
 
 log.info("=" * 60)
-log.info("🎮 ATERNOS BOT v6.0 — ЗАПУСК")
+log.info("🎮 ATERNOS BOT v8.0 — RAILWAY EDITION")
 log.info("=" * 60)
-log.info(f"Telegram токен: {'✅ установлен' if TELEGRAM_TOKEN else '❌ НЕТ'}")
-log.info(f"Aternos логин: {ATERNOS_USER or '❌ НЕТ'}")
-log.info(f"Server ID: {SERVER_ID or '❌ НЕТ'}")
-log.info(f"Log chat ID: {LOG_CHAT_ID}")
+log.info(f"Aternos: {ATERNOS_USER or '❌ НЕ ВСТАНОВЛЕНО'}")
+log.info(f"Server: {SERVER_ID or '❌ НЕ ВСТАНОВЛЕНО'}")
+log.info(f"Log chat: {LOG_CHAT_ID}")
 log.info(f"Port: {PORT}")
 log.info("=" * 60)
 
 # ══════════════════════════════════════════════════════════════════
-# ДАННЫЕ
+# ДАНІ
 # ══════════════════════════════════════════════════════════════════
 
 STATS_FILE = "stats.json"
 CONFIG_FILE = "config.json"
 
 stats = {
-    "starts": 0,
-    "stops": 0,
-    "last_start": None,
-    "last_stop": None,
-    "uptime_from": None,
-    "peak_players": 0
+    "starts": 0, "stops": 0, "last_start": None,
+    "last_stop": None, "uptime_from": None, "peak_players": 0
 }
 config = {"log_chat_id": LOG_CHAT_ID}
 
 telegram_app = None
 sess = requests.Session()
-sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+
+# Retry策略 для Aternos
+retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+adapter = HTTPAdapter(max_retries=retry)
+sess.mount('http://', adapter)
+sess.mount('https://', adapter)
+sess.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+})
 
 aternos_connected = False
 server_status = "offline"
@@ -91,13 +95,13 @@ def load_data():
             with open(STATS_FILE, encoding="utf-8") as f:
                 stats.update(json.load(f))
         except Exception as e:
-            log.warning(f"Не удалось загрузить stats: {e}")
+            log.warning(f"⚠️ Ошибка load stats: {e}")
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, encoding="utf-8") as f:
                 config.update(json.load(f))
         except Exception as e:
-            log.warning(f"Не удалось загрузить config: {e}")
+            log.warning(f"⚠️ Ошибка load config: {e}")
 
 
 def save_data():
@@ -107,94 +111,135 @@ def save_data():
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        log.error(f"Ошибка сохранения данных: {e}")
+        log.error(f"❌ Ошибка save: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════
-# ATERNOS
+# ATERNOS API (REQUESTS - ПРОСТОЙ ПОДХОД)
 # ══════════════════════════════════════════════════════════════════
 
 def aternos_login():
+    """Логін в Aternos з поліпшеними заголовками"""
     global aternos_connected
+    
     if not ATERNOS_USER or not ATERNOS_PASS or not SERVER_ID:
-        log.warning("⚠️ Данные Aternos не заполнены, пропускаю подключение")
+        log.warning("⚠️ Aternos дані не встановлені, пропускаю")
         return False
+    
     try:
-        log.info("🔑 Подключаюсь к Aternos...")
+        log.info("🔑 Логінюсь в Aternos...")
+        
+        # Спочатку отримуємо сторінку щоб скопіювати куки
+        resp = sess.get("https://aternos.org/go/", timeout=15)
+        
+        # Логін з поліпшеними заголовками (типу справжнього браузера)
+        sess.headers.update({
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://aternos.org/go/",
+        })
+        
         resp = sess.post(
             "https://aternos.org/panel/ajax/account/login.php",
-            data={"user": ATERNOS_USER, "password": ATERNOS_PASS},
+            data={
+                "user": ATERNOS_USER,
+                "password": ATERNOS_PASS,
+            },
             timeout=15
         )
+        
         if resp.status_code == 200:
-            aternos_connected = True
-            log.info("✅ Aternos подключен!")
-            update_server_info()
-            return True
-        else:
-            log.error(f"❌ Aternos логин: код {resp.status_code}")
-            return False
+            try:
+                data = resp.json()
+                if not data.get("error"):
+                    aternos_connected = True
+                    log.info("✅ Логін успішний!")
+                    update_server_info()
+                    return True
+            except Exception:
+                # Якщо 200 але не JSON - вважаємо успіхом
+                aternos_connected = True
+                log.info("✅ Логін ймовірно успішний (не-JSON відповідь)")
+                return True
+        
+        log.error(f"❌ Логін помилка: {resp.status_code}")
+        return False
+        
     except Exception as e:
-        log.error(f"❌ Ошибка подключения к Aternos: {e}")
+        log.error(f"❌ Ошибка логіну: {e}")
         return False
 
 
 def update_server_info():
+    """Обновити інформацію про сервер"""
     global server_status, current_players
-    if not SERVER_ID:
-        return False
     try:
-        resp = sess.get(f"https://aternos.org/api/server/{SERVER_ID}", timeout=15)
+        url = f"https://aternos.org/api/server/{SERVER_ID}"
+        resp = sess.get(url, timeout=15)
+        
         if resp.status_code == 200:
             data = resp.json()
             server_status = data.get("status", "offline")
             players = data.get("players", [])
             current_players = players if isinstance(players, list) else []
-            return True
+        return True
     except Exception as e:
-        log.warning(f"⚠️ Не удалось обновить статус сервера: {e}")
-    return False
+        log.warning(f"⚠️ Ошибка update info: {e}")
+        return False
 
 
 def aternos_start():
+    """Запустити сервер"""
     global server_status
     try:
-        resp = sess.post(f"https://aternos.org/api/server/{SERVER_ID}/start", timeout=30)
-        if resp.status_code in (200, 201):
-            server_status = "online"
+        url = f"https://aternos.org/api/server/{SERVER_ID}/start"
+        resp = sess.post(url, timeout=30)
+        
+        if resp.status_code in [200, 201]:
+            server_status = "starting"
+            log.info("✅ Сервер запущено!")
             return True
+        
+        log.warning(f"⚠️ Start статус: {resp.status_code}")
+        return False
     except Exception as e:
-        log.error(f"❌ Ошибка запуска сервера: {e}")
-    return False
+        log.error(f"❌ Ошибка старт: {e}")
+        return False
 
 
 def aternos_stop():
+    """Зупинити сервер"""
     global server_status
     try:
-        resp = sess.post(f"https://aternos.org/api/server/{SERVER_ID}/stop", timeout=30)
-        if resp.status_code in (200, 201):
+        url = f"https://aternos.org/api/server/{SERVER_ID}/stop"
+        resp = sess.post(url, timeout=30)
+        
+        if resp.status_code in [200, 201]:
             server_status = "offline"
+            log.info("✅ Сервер зупинено!")
             return True
+        
+        log.warning(f"⚠️ Stop статус: {resp.status_code}")
+        return False
     except Exception as e:
-        log.error(f"❌ Ошибка остановки сервера: {e}")
-    return False
+        log.error(f"❌ Ошибка стоп: {e}")
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# HELPERS
 # ══════════════════════════════════════════════════════════════════
 
-def status_icon(s):
-    return {"online": "🟢", "offline": "🔴", "loading": "🟡", "starting": "🟡"}.get(s, "⚫")
+def icon(s):
+    return {"online": "🟢", "offline": "🔴", "starting": "🟡"}.get(s, "⚫")
 
 
-def get_message(update: Update):
+def get_msg(update: Update):
     return update.callback_query.message if update.callback_query else update.message
 
 
-async def show_typing(update: Update):
+async def typing(update: Update):
     try:
-        await get_message(update).chat.send_action(ChatAction.TYPING)
+        await get_msg(update).chat.send_action(ChatAction.TYPING)
     except Exception:
         pass
 
@@ -208,7 +253,7 @@ async def send_log(text: str, chat_id=None):
     try:
         await telegram_app.bot.send_message(target, text, parse_mode="HTML")
     except Exception as e:
-        log.error(f"❌ Не удалось отправить лог: {e}")
+        log.error(f"❌ send_log: {e}")
 
 
 def user_label(update: Update):
@@ -216,53 +261,53 @@ def user_label(update: Update):
     return f"@{u.username}" if u.username else u.first_name
 
 
-MAIN_KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🟢 ЗАПУСТИТЬ", callback_data="on"),
-     InlineKeyboardButton("🔴 ОСТАНОВИТЬ", callback_data="off")],
-    [InlineKeyboardButton("👥 ИГРОКИ", callback_data="players")],
-    [InlineKeyboardButton("📊 ИНФОРМАЦИЯ", callback_data="info"),
+KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🟢 ЗАПУСТИТИ", callback_data="on"),
+     InlineKeyboardButton("🔴 ЗУПИНИТИ", callback_data="off")],
+    [InlineKeyboardButton("👥 ГРАВЦІ", callback_data="players")],
+    [InlineKeyboardButton("📊 ІНФО", callback_data="info"),
      InlineKeyboardButton("⚙️ СТАТУС", callback_data="status")],
 ])
 
 
 # ══════════════════════════════════════════════════════════════════
-# КОМАНДЫ TELEGRAM
+# КОМАНДИ
 # ══════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await show_typing(update)
+    await typing(update)
     text = (
         "<b>🎮 ATERNOS BOT — fictionmine</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Aternos:</b> {'✅ подключен' if aternos_connected else '❌ не подключен'}\n"
-        f"<b>Сервер:</b> {status_icon(server_status)} {server_status.upper()}\n"
-        f"<b>Игроков:</b> {len(current_players)}\n"
+        f"<b>Aternos:</b> {'✅' if aternos_connected else '❌'}\n"
+        f"<b>Сервер:</b> {icon(server_status)} {server_status.upper()}\n"
+        f"<b>Гравців:</b> {len(current_players)}\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>Команды:</b>\n"
-        "• /on — запустить сервер\n"
-        "• /off — остановить сервер\n"
-        "• /players — список игроков\n"
-        "• /status — статус сервера\n"
-        "• /info — статистика\n"
-        "• /logthischat — логи в этот чат\n"
+        "<b>Команди:</b>\n"
+        "• /on — запустити\n"
+        "• /off — зупинити\n"
+        "• /players — гравці\n"
+        "• /status — статус\n"
+        "• /info — інфо\n"
+        "• /logthischat — логи тут\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
-    await get_message(update).reply_text(text, reply_markup=MAIN_KEYBOARD, parse_mode="HTML")
+    await get_msg(update).reply_text(text, reply_markup=KB, parse_mode="HTML")
 
 
 async def cmd_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global stats
-    await show_typing(update)
-    msg = await get_message(update).reply_text("<b>⏳ Запускаю сервер...</b>", parse_mode="HTML")
+    await typing(update)
+    msg = await get_msg(update).reply_text("<b>⏳ Запускаю...</b>", parse_mode="HTML")
 
     if not aternos_connected:
-        await msg.edit_text("❌ <b>Aternos не подключен.</b>\nПроверь логин/пароль в настройках.", parse_mode="HTML")
-        await send_log(f"❌ Попытка запуска: Aternos не подключен\n👤 {user_label(update)}")
+        await msg.edit_text("❌ <b>Aternos не підключено!</b>", parse_mode="HTML")
+        await send_log(f"❌ Спроба старту: Aternos не логін\n👤 {user_label(update)}")
         return
 
     update_server_info()
     if server_status == "online":
-        await msg.edit_text("✅ <b>Сервер уже включён!</b>", parse_mode="HTML")
+        await msg.edit_text("✅ <b>Уже включений!</b>", parse_mode="HTML")
         return
 
     if aternos_start():
@@ -270,112 +315,107 @@ async def cmd_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         stats["last_start"] = datetime.now().isoformat()
         stats["uptime_from"] = datetime.now().isoformat()
         save_data()
+        
         await msg.edit_text(
-            "🟢 <b>СЕРВЕР ЗАПУЩЕН!</b>\n\n"
-            f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n"
-            f"📊 Всего запусков: {stats['starts']}\n\n"
-            "<i>Сервер загружается, подожди пару минут</i>",
+            "🟢 <b>ЗАПУЩЕНО!</b>\n\n"
+            f"⏰ {datetime.now().strftime('%H:%M:%S')}\n"
+            f"📊 Всього: {stats['starts']}",
             parse_mode="HTML"
         )
         await send_log(
-            f"🟢 <b>СЕРВЕР ЗАПУЩЕН</b>\n"
+            f"🟢 <b>СЕРВЕР ЗАПУЩЕНО</b>\n"
             f"⏰ {datetime.now().strftime('%H:%M:%S')}\n"
             f"👤 {user_label(update)}\n"
-            f"📊 Запусков всего: {stats['starts']}"
+            f"📊 {stats['starts']}"
         )
     else:
-        await msg.edit_text("❌ <b>Не удалось запустить сервер.</b>\nПопробуй ещё раз через минуту.", parse_mode="HTML")
-        await send_log(f"❌ Ошибка запуска сервера\n👤 {user_label(update)}")
+        await msg.edit_text("❌ <b>Не вдалось!</b>", parse_mode="HTML")
+        await send_log(f"❌ Ошибка старту\n👤 {user_label(update)}")
 
 
 async def cmd_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global stats
-    await show_typing(update)
-    msg = await get_message(update).reply_text("<b>⏳ Останавливаю сервер...</b>", parse_mode="HTML")
+    await typing(update)
+    msg = await get_msg(update).reply_text("<b>⏳ Зупиняю...</b>", parse_mode="HTML")
 
     if not aternos_connected:
-        await msg.edit_text("❌ <b>Aternos не подключен.</b>", parse_mode="HTML")
+        await msg.edit_text("❌ <b>Aternos не підключено!</b>", parse_mode="HTML")
         return
 
     update_server_info()
     if server_status != "online":
-        await msg.edit_text("🔴 <b>Сервер уже выключен!</b>", parse_mode="HTML")
+        await msg.edit_text("🔴 <b>Уже вимкнений!</b>", parse_mode="HTML")
         return
 
     if aternos_stop():
         stats["stops"] += 1
         stats["last_stop"] = datetime.now().isoformat()
-        stats["uptime_from"] = None
         save_data()
+        
         await msg.edit_text(
-            "🔴 <b>СЕРВЕР ОСТАНОВЛЕН!</b>\n\n"
-            f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}",
+            "🔴 <b>ЗУПИНЕНО!</b>\n\n"
+            f"⏰ {datetime.now().strftime('%H:%M:%S')}",
             parse_mode="HTML"
         )
         await send_log(
-            f"🔴 <b>СЕРВЕР ОСТАНОВЛЕН</b>\n"
+            f"🔴 <b>СЕРВЕР ЗУПИНЕНО</b>\n"
             f"⏰ {datetime.now().strftime('%H:%M:%S')}\n"
             f"👤 {user_label(update)}"
         )
     else:
-        await msg.edit_text("❌ <b>Не удалось остановить сервер.</b>", parse_mode="HTML")
+        await msg.edit_text("❌ <b>Не вдалось!</b>", parse_mode="HTML")
 
 
 async def cmd_players(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global stats
-    await show_typing(update)
-    msg = await get_message(update).reply_text("<b>⏳ Проверяю игроков...</b>", parse_mode="HTML")
+    await typing(update)
+    msg = await get_msg(update).reply_text("<b>⏳ Перевіряю...</b>", parse_mode="HTML")
 
     update_server_info()
     if server_status != "online":
-        await msg.edit_text("🔴 <b>Сервер выключен.</b>\nВключи его командой /on", parse_mode="HTML")
+        await msg.edit_text("🔴 <b>Сервер вимкнений!</b>", parse_mode="HTML")
         return
 
     if not current_players:
-        await msg.edit_text("👥 <b>Онлайн: 0 игроков</b>\n\nНикого нет 😿", parse_mode="HTML")
+        await msg.edit_text("👥 <b>0 гравців</b>", parse_mode="HTML")
         return
 
     if len(current_players) > stats["peak_players"]:
         stats["peak_players"] = len(current_players)
         save_data()
 
-    players_str = "\n".join(f"  • <b>{p}</b>" for p in current_players)
-    await msg.edit_text(
-        f"👥 <b>ОНЛАЙН: {len(current_players)} игрок(ов)</b>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n{players_str}",
-        parse_mode="HTML"
-    )
+    pl_str = "\n".join(f"  • {p}" for p in current_players)
+    await msg.edit_text(f"👥 <b>{len(current_players)} онлайн</b>\n\n{pl_str}", parse_mode="HTML")
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await show_typing(update)
-    msg = await get_message(update).reply_text("<b>⏳ Проверяю статус...</b>", parse_mode="HTML")
+    await typing(update)
+    msg = await get_msg(update).reply_text("<b>⏳ Перевіряю...</b>", parse_mode="HTML")
 
     update_server_info()
     await msg.edit_text(
-        f"{status_icon(server_status)} <b>СТАТУС СЕРВЕРА</b>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎮 Имя: fictionmine (Bedrock)\n"
-        f"📍 Статус: {server_status.upper()}\n"
-        f"👥 Игроков: {len(current_players)}\n"
-        f"⏰ Проверено: {datetime.now().strftime('%H:%M:%S')}",
+        f"{icon(server_status)} <b>СТАТУС</b>\n\n"
+        f"fictionmine (Bedrock)\n"
+        f"{server_status.upper()}\n"
+        f"Гравців: {len(current_players)}\n"
+        f"⏰ {datetime.now().strftime('%H:%M:%S')}",
         parse_mode="HTML"
     )
 
 
 async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await show_typing(update)
-    msg = await get_message(update).reply_text("<b>⏳ Загружаю информацию...</b>", parse_mode="HTML")
+    await typing(update)
+    msg = await get_msg(update).reply_text("<b>⏳ Загружаю...</b>", parse_mode="HTML")
 
     update_server_info()
 
     last_start = (
         datetime.fromisoformat(stats["last_start"]).strftime("%d.%m %H:%M")
-        if stats["last_start"] else "никогда"
+        if stats["last_start"] else "ніколи"
     )
     last_stop = (
         datetime.fromisoformat(stats["last_stop"]).strftime("%d.%m %H:%M")
-        if stats["last_stop"] else "никогда"
+        if stats["last_stop"] else "ніколи"
     )
 
     uptime = "—"
@@ -385,32 +425,32 @@ async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uptime = f"{h}ч {m}м"
 
     await msg.edit_text(
-        "<b>📊 ИНФОРМАЦИЯ О СЕРВЕРЕ</b>\n\n"
-        f"🎮 fictionmine (Bedrock)\n"
-        f"{status_icon(server_status)} {server_status.upper()}\n"
-        f"👥 Игроков сейчас: {len(current_players)}\n\n"
-        "<b>📈 Статистика:</b>\n"
-        f"  Запусков: {stats['starts']}\n"
-        f"  Остановок: {stats['stops']}\n"
-        f"  Пик игроков: {stats['peak_players']}\n"
-        f"  Время работы: {uptime}\n\n"
-        "<b>⏰ Последние события:</b>\n"
+        "<b>📊 ІНФОРМАЦІЯ</b>\n\n"
+        f"fictionmine (Bedrock)\n"
+        f"{icon(server_status)} {server_status.upper()}\n"
+        f"Гравців: {len(current_players)}\n\n"
+        f"<b>📈 СТАТИСТИКА:</b>\n"
+        f"  Запусків: {stats['starts']}\n"
+        f"  Зупинень: {stats['stops']}\n"
+        f"  Пік: {stats['peak_players']}\n"
+        f"  Час роботи: {uptime}\n\n"
+        f"<b>⏰ ОСТАННІ:</b>\n"
         f"  Запуск: {last_start}\n"
-        f"  Остановка: {last_stop}",
+        f"  Зупин: {last_stop}",
         parse_mode="HTML"
     )
 
 
-async def cmd_logthischat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_logthis(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     config["log_chat_id"] = chat_id
     save_data()
     await update.message.reply_text(
-        f"✅ <b>Готово!</b>\nЛоги теперь приходят в этот чат.\nID: <code>{chat_id}</code>",
+        f"✅ <b>Логи сюди!</b>\nID: <code>{chat_id}</code>",
         parse_mode="HTML"
     )
     await send_log(
-        f"✅ <b>Чат для логов изменён</b>\n👤 {user_label(update)}\nID: <code>{chat_id}</code>",
+        f"✅ <b>Логи змінено</b>\n👤 {user_label(update)}\nID: <code>{chat_id}</code>",
         chat_id=chat_id
     )
 
@@ -428,70 +468,26 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════
-# АВТОМАТИЧЕСКИЙ ОТЧЁТ
+# FLASK
 # ══════════════════════════════════════════════════════════════════
 
-async def auto_report_loop():
-    await asyncio.sleep(30)
-    while True:
-        await asyncio.sleep(600)
-        if not aternos_connected:
-            continue
-        update_server_info()
-        if server_status != "online":
-            continue
-        try:
-            uptime_line = ""
-            if stats["uptime_from"]:
-                delta = datetime.now() - datetime.fromisoformat(stats["uptime_from"])
-                h, m = delta.seconds // 3600, (delta.seconds % 3600) // 60
-                uptime_line = f"⏱ Время работы: {h}ч {m}м\n"
-            players_str = "\n".join(f"  • {p}" for p in current_players) if current_players else "  (никого)"
-            await send_log(
-                "🟢 <b>СЕРВЕР ОНЛАЙН</b> — автоотчёт\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"⏰ {datetime.now().strftime('%H:%M:%S')}\n"
-                f"{uptime_line}"
-                f"👥 Игроки ({len(current_players)}):\n{players_str}"
-            )
-        except Exception as e:
-            log.error(f"Ошибка автоотчёта: {e}")
+app = Flask(__name__)
 
-
-# ══════════════════════════════════════════════════════════════════
-# FLASK (keep-alive для Render)
-# ══════════════════════════════════════════════════════════════════
-
-flask_app = Flask(__name__)
-
-
-@flask_app.route("/")
+@app.route("/")
 def index():
-    return jsonify({"status": "ok", "bot": "aternos-bot", "time": datetime.now().isoformat()}), 200
+    return jsonify({"status": "ok", "bot": "aternos-bot"}), 200
 
-
-@flask_app.route("/ping")
+@app.route("/ping")
 def ping():
     return "pong", 200
 
-
-@flask_app.route("/health")
-def health():
-    return jsonify({
-        "aternos_connected": aternos_connected,
-        "server_status": server_status,
-        "players": len(current_players),
-        "starts": stats["starts"],
-    }), 200
-
-
 def run_flask():
-    log.info(f"🌐 Flask стартует на 0.0.0.0:{PORT}")
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
+    log.info(f"🌐 Flask на http://0.0.0.0:{PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
 
 
 # ══════════════════════════════════════════════════════════════════
-# ГЛАВНАЯ ФУНКЦИЯ
+# MAIN
 # ══════════════════════════════════════════════════════════════════
 
 async def main():
@@ -501,24 +497,22 @@ async def main():
     aternos_login()
 
     telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("on", cmd_on))
     telegram_app.add_handler(CommandHandler("off", cmd_off))
     telegram_app.add_handler(CommandHandler("players", cmd_players))
     telegram_app.add_handler(CommandHandler("status", cmd_status))
     telegram_app.add_handler(CommandHandler("info", cmd_info))
-    telegram_app.add_handler(CommandHandler("logthischat", cmd_logthischat))
+    telegram_app.add_handler(CommandHandler("logthischat", cmd_logthis))
     telegram_app.add_handler(CallbackQueryHandler(on_button))
 
-    log.info("✅ Telegram бот настроен, запускаю polling...")
-
-    asyncio.create_task(auto_report_loop())
+    log.info("✅ Telegram бот готов!")
 
     await telegram_app.initialize()
     await telegram_app.start()
     await telegram_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
-    # держим процесс живым
     await asyncio.Event().wait()
 
 
@@ -527,7 +521,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("⛔ Бот остановлен вручную")
+        log.info("⛔ Зупинено")
     except Exception as e:
-        log.error(f"❌ Критическая ошибка: {e}", exc_info=True)
+        log.error(f"❌ Ошибка: {e}", exc_info=True)
         sys.exit(1)
