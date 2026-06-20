@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-ATERNOS TELEGRAM BOT v11.0
-python-aternos бібліотека для логіну (обходить Cloudflare)
+ATERNOS TELEGRAM BOT v12.0
+Використовує реальний WebSocket протокол Aternos
 """
 
-import os, sys, json, asyncio, logging, random
+import os, sys, json, asyncio, logging, random, hashlib, re
 from datetime import datetime
 from threading import Thread
 
+import requests
+import cloudscraper
 from flask import Flask, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -40,7 +42,7 @@ if not TELEGRAM_TOKEN:
     sys.exit(1)
 
 log.info("=" * 60)
-log.info("🎮 ATERNOS BOT v11.0 — python-aternos edition")
+log.info("🎮 ATERNOS BOT v12.0 — fictionmine")
 log.info("=" * 60)
 
 # ══════════════════════════════════════════════════════════════════
@@ -69,17 +71,17 @@ admins: set = set()
 users: dict = {}
 
 telegram_app      = None
-aternos_client    = None   # python-aternos клієнт
-aternos_server    = None   # об'єкт сервера
+aternos_scraper   = None
 aternos_connected = False
 server_status     = "offline"
 current_players   = []
+server_address    = ""
 
-WAIT_CODE = 1
+WAIT_CODE      = 1
+WAIT_BROADCAST = 2
+WAIT_MOTD      = 3
+WAIT_ANNOUNCE  = 4
 
-# ══════════════════════════════════════════════════════════════════
-# ЗБЕРЕЖЕННЯ
-# ══════════════════════════════════════════════════════════════════
 
 def load_all():
     global stats, config, admins, users
@@ -110,7 +112,7 @@ def save_all():
         with open(ADMINS_FILE, "w", encoding="utf-8") as f: json.dump(list(admins), f)
         with open(USERS_FILE,  "w", encoding="utf-8") as f: json.dump(users, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        log.error(f"❌ Ошибка сохранения: {e}")
+        log.error(f"❌ save: {e}")
 
 def reg(update: Update):
     u = update.effective_user
@@ -122,43 +124,75 @@ def reg(update: Update):
     stats["total_commands"] = stats.get("total_commands", 0) + 1
 
 # ══════════════════════════════════════════════════════════════════
-# ATERNOS — cloudscraper (обходить Cloudflare)
+# ATERNOS — реальний підхід через сесію сайту
 # ══════════════════════════════════════════════════════════════════
 
-def aternos_login() -> bool:
-    global aternos_client, aternos_server, aternos_connected, server_status, current_players
+def _make_scraper():
+    """Створює cloudscraper з правильними заголовками"""
+    s = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+    s.headers.update({
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "application/json, text/plain, */*",
+    })
+    return s
 
-    if not all([ATERNOS_USER, ATERNOS_PASS, SERVER_ID]):
-        log.warning("⚠️ Данные Aternos не заполнены")
+
+def aternos_login() -> bool:
+    global aternos_scraper, aternos_connected, server_status, current_players, server_address
+
+    if not all([ATERNOS_USER, ATERNOS_PASS]):
+        log.warning("⚠️ ATERNOS_USER або ATERNOS_PASS не вказано")
         return False
 
     try:
-        import cloudscraper, hashlib
-        log.info(f"🔑 Логинюсь в Aternos как {ATERNOS_USER}...")
+        s = _make_scraper()
 
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
+        # Крок 1: отримати головну сторінку (CSRF + куки)
+        log.info("🌐 Відкриваю aternos.org...")
+        r = s.get("https://aternos.org/", timeout=20)
+        log.info(f"   / → {r.status_code}")
 
-        r = scraper.get("https://aternos.org/go/", timeout=20)
-        log.info(f"   GET /go/ → {r.status_code}")
+        # Крок 2: отримати сторінку логіну
+        r = s.get("https://aternos.org/go/", timeout=20)
+        log.info(f"   /go/ → {r.status_code}")
 
-        r = scraper.post(
+        # Крок 3: логін — пробуємо plain text пароль
+        log.info(f"🔑 Логінюсь як {ATERNOS_USER}...")
+        r = s.post(
             "https://aternos.org/panel/ajax/account/login.php",
-            data={
-                "user":     ATERNOS_USER,
-                "password": hashlib.sha256(ATERNOS_PASS.encode()).hexdigest(),
-            },
+            data={"user": ATERNOS_USER, "password": ATERNOS_PASS},
             headers={
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": "https://aternos.org/go/",
-                "Origin":  "https://aternos.org",
+                "Origin": "https://aternos.org",
+                "Content-Type": "application/x-www-form-urlencoded",
             },
             timeout=20,
         )
-        log.info(f"   POST login → {r.status_code}")
+        log.info(f"   login plain → {r.status_code} | {r.text[:100]}")
 
-        if r.status_code == 200:
+        # Якщо 503/403 — пробуємо з SHA256
+        if r.status_code not in (200, 201):
+            log.info("   Пробую SHA256 пароль...")
+            r = s.post(
+                "https://aternos.org/panel/ajax/account/login.php",
+                data={
+                    "user": ATERNOS_USER,
+                    "password": hashlib.sha256(ATERNOS_PASS.encode()).hexdigest(),
+                },
+                headers={
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": "https://aternos.org/go/",
+                    "Origin": "https://aternos.org",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                timeout=20,
+            )
+            log.info(f"   login sha256 → {r.status_code} | {r.text[:100]}")
+
+        if r.status_code in (200, 201):
             try:
                 data = r.json()
                 if data.get("error"):
@@ -166,35 +200,98 @@ def aternos_login() -> bool:
                     return False
             except Exception:
                 pass
-            aternos_client = scraper
+
+            aternos_scraper = s
             aternos_connected = True
-            log.info("✅ Aternos підключено!")
-            update_server_info()
+            log.info("✅ Aternos: логін успішний!")
+            _fetch_server_info()
             return True
 
-        log.error(f"❌ Логін: {r.status_code}")
-        return False
+        log.error(f"❌ Логін: {r.status_code} — Aternos блокує IP Railway")
+        log.error("   → Потрібні куки з браузера (ATERNOS_COOKIES змінна)")
+        _try_cookie_login(s)
+        return aternos_connected
 
     except Exception as e:
         log.error(f"❌ Помилка логіну: {e}", exc_info=True)
         return False
 
 
+def _try_cookie_login(s):
+    """Спроба логіну через куки з env змінної"""
+    global aternos_scraper, aternos_connected
+    cookies_raw = os.getenv("ATERNOS_COOKIES", "")
+    if not cookies_raw:
+        log.warning("⚠️ ATERNOS_COOKIES не встановлено — логін неможливий")
+        return False
+
+    try:
+        log.info("🍪 Пробую логін через куки...")
+        cookies = json.loads(cookies_raw)
+        for k, v in cookies.items():
+            s.cookies.set(k, v)
+
+        # Перевіряємо чи куки валідні
+        r = s.get("https://aternos.org/servers/", timeout=15)
+        log.info(f"   /servers/ → {r.status_code}")
+
+        if r.status_code == 200 and "servers" in r.url:
+            aternos_scraper = s
+            aternos_connected = True
+            log.info("✅ Логін через куки успішний!")
+            _fetch_server_info()
+            return True
+        else:
+            log.error("❌ Куки недійсні або застаріли")
+            return False
+    except Exception as e:
+        log.error(f"❌ Cookie login: {e}")
+        return False
+
+
+def _fetch_server_info():
+    """Отримуємо інфо про сервер після логіну"""
+    global server_status, current_players, server_address
+    if not aternos_scraper:
+        return
+
+    try:
+        # Отримуємо список серверів
+        r = aternos_scraper.get("https://aternos.org/panel/ajax/servers.php", timeout=15)
+        log.info(f"   /servers/ → {r.status_code}")
+        if r.status_code == 200:
+            data = r.json()
+            servers = data.get("servers", [])
+            log.info(f"   Знайдено серверів: {len(servers)}")
+            for srv in servers:
+                log.info(f"   → {srv.get('name')} | {srv.get('status')} | id={srv.get('id')}")
+    except Exception as e:
+        log.warning(f"⚠️ _fetch_server_info: {e}")
+
+
 def update_server_info() -> bool:
     global server_status, current_players
-    if not aternos_client:
+    if not aternos_scraper or not SERVER_ID:
         return False
     try:
-        r = aternos_client.get(
-            f"https://aternos.org/api/server/{SERVER_ID}", timeout=15
+        r = aternos_scraper.get(
+            f"https://aternos.org/panel/ajax/status.php?server={SERVER_ID}",
+            timeout=15
         )
         if r.status_code == 200:
             d = r.json()
-            server_status   = d.get("status", "offline")
-            p = d.get("players", [])
-            current_players = p if isinstance(p, list) else []
+            server_status = d.get("status", "offline")
+            p = d.get("players", {})
+            if isinstance(p, dict):
+                current_players = p.get("list", [])
+            elif isinstance(p, list):
+                current_players = p
+            else:
+                current_players = []
             log.info(f"📊 {server_status} | {len(current_players)} гравців")
-        return True
+            return True
+        log.warning(f"⚠️ status: {r.status_code}")
+        return False
     except Exception as e:
         log.warning(f"⚠️ update_info: {e}")
         return False
@@ -202,16 +299,17 @@ def update_server_info() -> bool:
 
 def aternos_start() -> bool:
     global server_status
-    if not aternos_client:
+    if not aternos_scraper or not SERVER_ID:
         return False
     try:
-        r = aternos_client.post(
-            f"https://aternos.org/api/server/{SERVER_ID}/start", timeout=30
+        r = aternos_scraper.get(
+            f"https://aternos.org/panel/ajax/start.php?server={SERVER_ID}",
+            timeout=30
         )
-        if r.status_code in (200, 201):
+        log.info(f"   start → {r.status_code}")
+        if r.status_code == 200:
             server_status = "starting"
             return True
-        log.warning(f"⚠️ start: {r.status_code}")
         return False
     except Exception as e:
         log.error(f"❌ start: {e}")
@@ -220,16 +318,17 @@ def aternos_start() -> bool:
 
 def aternos_stop() -> bool:
     global server_status
-    if not aternos_client:
+    if not aternos_scraper or not SERVER_ID:
         return False
     try:
-        r = aternos_client.post(
-            f"https://aternos.org/api/server/{SERVER_ID}/stop", timeout=30
+        r = aternos_scraper.get(
+            f"https://aternos.org/panel/ajax/stop.php?server={SERVER_ID}",
+            timeout=30
         )
-        if r.status_code in (200, 201):
+        log.info(f"   stop → {r.status_code}")
+        if r.status_code == 200:
             server_status = "offline"
             return True
-        log.warning(f"⚠️ stop: {r.status_code}")
         return False
     except Exception as e:
         log.error(f"❌ stop: {e}")
@@ -240,7 +339,7 @@ def aternos_stop() -> bool:
 # ══════════════════════════════════════════════════════════════════
 
 def icon(s):
-    return {"online":"🟢","offline":"🔴","starting":"🟡","loading":"🟡"}.get(s,"⚫")
+    return {"online":"🟢","offline":"🔴","starting":"🟡","loading":"🟡","stopping":"🟠"}.get(s,"⚫")
 
 def get_msg(update: Update):
     return update.callback_query.message if update.callback_query else update.message
@@ -270,7 +369,7 @@ def now_str():  return datetime.now().strftime("%H:%M:%S")
 def now_full(): return datetime.now().strftime("%d.%m.%Y %H:%M:%S")
 
 def get_uptime() -> str:
-    if stats.get("uptime_from") and server_status == "online":
+    if stats.get("uptime_from") and server_status in ("online", "starting"):
         delta = datetime.now() - datetime.fromisoformat(stats["uptime_from"])
         h = delta.seconds // 3600
         m = (delta.seconds % 3600) // 60
@@ -284,28 +383,31 @@ def get_uptime() -> str:
 def main_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🟢 Запустить сервер", callback_data="on")],
-        [InlineKeyboardButton("👥 Игроки онлайн",    callback_data="players"),
-         InlineKeyboardButton("⚙️ Статус",           callback_data="status")],
-        [InlineKeyboardButton("📊 Инфо",             callback_data="info"),
-         InlineKeyboardButton("🗺 Подключиться",      callback_data="connect")],
+        [InlineKeyboardButton("👥 Игроки",   callback_data="players"),
+         InlineKeyboardButton("⚙️ Статус",   callback_data="status")],
+        [InlineKeyboardButton("📊 Инфо",     callback_data="info"),
+         InlineKeyboardButton("🗺 Войти",     callback_data="connect")],
     ])
 
 def admin_kb():
     m = config.get("maintenance", False)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟢 Запустить",        callback_data="adm_start"),
-         InlineKeyboardButton("🔴 Остановить",       callback_data="adm_stop")],
-        [InlineKeyboardButton("🔄 Перезапустить",    callback_data="adm_restart")],
-        [InlineKeyboardButton("📢 Броадкаст",        callback_data="adm_broadcast")],
-        [InlineKeyboardButton("👥 Пользователи",     callback_data="adm_users")],
-        [InlineKeyboardButton("📊 Статистика",       callback_data="adm_stats")],
+        [InlineKeyboardButton("🟢 Запустить",    callback_data="adm_start"),
+         InlineKeyboardButton("🔴 Остановить",   callback_data="adm_stop")],
+        [InlineKeyboardButton("🔄 Перезапустить",callback_data="adm_restart")],
+        [InlineKeyboardButton("📢 Броадкаст всем",      callback_data="adm_broadcast")],
+        [InlineKeyboardButton("📣 Анонс (красиво)",     callback_data="adm_announce")],
+        [InlineKeyboardButton("👥 Пользователи",         callback_data="adm_users")],
+        [InlineKeyboardButton("📊 Статистика",           callback_data="adm_stats")],
+        [InlineKeyboardButton("🗑 Сбросить статистику",  callback_data="adm_resetstats")],
         [InlineKeyboardButton(
             f"{'🔴 Выкл' if m else '🟢 Вкл'} техобслуживание",
             callback_data="adm_maintenance"
         )],
         [InlineKeyboardButton("🔄 Переподключить Aternos", callback_data="adm_reconnect")],
-        [InlineKeyboardButton("📜 Логи → этот чат",        callback_data="adm_setlog")],
-        [InlineKeyboardButton("❌ Закрыть панель",          callback_data="adm_exit")],
+        [InlineKeyboardButton("📜 Логи → этот чат",         callback_data="adm_setlog")],
+        [InlineKeyboardButton("🍪 Инфо о сессии",           callback_data="adm_session")],
+        [InlineKeyboardButton("❌ Закрыть",                  callback_data="adm_exit")],
     ])
 
 # ══════════════════════════════════════════════════════════════════
@@ -315,27 +417,24 @@ def admin_kb():
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reg(update); save_all(); await typing(update)
     if config.get("maintenance") and not is_admin(update):
-        await get_msg(update).reply_text("🔧 <b>Технические работы.</b>\nПопробуй позже!", parse_mode="HTML")
+        await get_msg(update).reply_text(
+            "🔧 <b>Технические работы!</b>\nПопробуй позже.", parse_mode="HTML")
         return
-    text = (
-        f"<b>🎮 Добро пожаловать на {config['server_name']}!</b>\n\n"
+    await asyncio.to_thread(update_server_info)
+    await get_msg(update).reply_text(
+        f"<b>🎮 {config['server_name']} — Minecraft Bedrock</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"{icon(server_status)} Сервер: <b>{server_status.upper()}</b>\n"
         f"👥 Игроков: <b>{len(current_players)}</b>\n"
         f"🌐 IP: <code>{config['server_ip']}</code>\n"
         f"🔌 Порт: <code>{config['server_port']}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>Команды:</b>\n"
-        "▶️ /on — запустить сервер\n"
+        "▶️ /on — запустить\n"
         "👥 /players — кто онлайн\n"
-        "⚙️ /status — статус\n"
-        "📊 /info — статистика\n"
         "🗺 /connect — как войти\n"
         "📜 /rules — правила\n"
-        "🎲 /random — совет\n"
-        "❓ /help — все команды"
-    )
-    await get_msg(update).reply_text(text, reply_markup=main_kb(), parse_mode="HTML")
+        "❓ /help — все команды",
+        reply_markup=main_kb(), parse_mode="HTML")
 
 
 async def cmd_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -345,15 +444,18 @@ async def cmd_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     msg = await get_msg(update).reply_text("⏳ <b>Запускаю сервер...</b>", parse_mode="HTML")
     if not aternos_connected:
-        await msg.edit_text("❌ <b>Aternos не подключён!</b>\nСообщи администратору.", parse_mode="HTML")
+        await msg.edit_text(
+            "❌ <b>Aternos не подключён!</b>\n"
+            "Администратор должен настроить куки сессии.\n"
+            "Напиши /help для информации.",
+            parse_mode="HTML")
         await send_log(f"❌ Попытка запуска без соединения\n👤 {ulabel(update)}")
         return
     await asyncio.to_thread(update_server_info)
     if server_status in ("online", "starting"):
         await msg.edit_text(
-            f"✅ <b>Сервер уже работает!</b>\n"
-            f"🌐 <code>{config['server_ip']}</code>",
-            parse_mode="HTML")
+            f"✅ <b>Сервер уже {'работает' if server_status == 'online' else 'запускается'}!</b>\n"
+            f"🌐 <code>{config['server_ip']}</code>", parse_mode="HTML")
         return
     ok = await asyncio.to_thread(aternos_start)
     if ok:
@@ -374,7 +476,8 @@ async def cmd_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"⏰ {now_full()}\n"
             f"📊 Запуск №{stats['starts']}")
     else:
-        await msg.edit_text("❌ <b>Не удалось запустить!</b>\nПопробуй позже.", parse_mode="HTML")
+        await msg.edit_text(
+            "❌ <b>Не удалось запустить!</b>\nПопробуй позже.", parse_mode="HTML")
         await send_log(f"❌ Ошибка запуска\n👤 {ulabel(update)}")
 
 
@@ -382,7 +485,8 @@ async def cmd_players(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reg(update); await typing(update)
     await asyncio.to_thread(update_server_info)
     if server_status != "online":
-        await get_msg(update).reply_text("🔴 <b>Сервер выключен.</b>\nЗапусти /on", parse_mode="HTML")
+        await get_msg(update).reply_text(
+            f"🔴 <b>Сервер {server_status.upper()}</b>\nЗапусти /on", parse_mode="HTML")
         return
     if not current_players:
         await get_msg(update).reply_text(
@@ -402,9 +506,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reg(update); await typing(update)
     await asyncio.to_thread(update_server_info)
     await get_msg(update).reply_text(
-        f"{icon(server_status)} <b>СТАТУС СЕРВЕРА</b>\n\n"
+        f"{icon(server_status)} <b>СТАТУС</b>\n\n"
         f"🎮 {config['server_name']} (Bedrock)\n"
-        f"📍 {server_status.upper()}\n"
+        f"📍 <b>{server_status.upper()}</b>\n"
         f"👥 Игроков: <b>{len(current_players)}</b>\n"
         f"🌐 <code>{config['server_ip']}</code>\n"
         f"🔌 Порт: <code>{config['server_port']}</code>\n"
@@ -416,40 +520,37 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reg(update); await typing(update)
     await asyncio.to_thread(update_server_info)
-    last_start = datetime.fromisoformat(stats["last_start"]).strftime("%d.%m %H:%M") if stats.get("last_start") else "никогда"
-    last_stop  = datetime.fromisoformat(stats["last_stop"]).strftime("%d.%m %H:%M")  if stats.get("last_stop")  else "никогда"
+    ls = datetime.fromisoformat(stats["last_start"]).strftime("%d.%m %H:%M") if stats.get("last_start") else "никогда"
+    lo = datetime.fromisoformat(stats["last_stop"]).strftime("%d.%m %H:%M")  if stats.get("last_stop")  else "никогда"
     await get_msg(update).reply_text(
-        f"<b>📊 ИНФОРМАЦИЯ — {config['server_name']}</b>\n\n"
-        f"{icon(server_status)} {server_status.upper()} | 👥 {len(current_players)} онлайн\n\n"
+        f"<b>📊 {config['server_name'].upper()} — ИНФОРМАЦИЯ</b>\n\n"
+        f"{icon(server_status)} {server_status.upper()} | 👥 {len(current_players)}\n\n"
         "<b>📈 Статистика:</b>\n"
         f"  🚀 Запусков: <b>{stats['starts']}</b>\n"
         f"  🛑 Остановок: <b>{stats['stops']}</b>\n"
         f"  🔄 Перезапусков: <b>{stats.get('restarts',0)}</b>\n"
-        f"  👑 Пик игроков: <b>{stats['peak_players']}</b>\n"
+        f"  👑 Пик: <b>{stats['peak_players']}</b>\n"
         f"  ⏱ Аптайм: <b>{get_uptime()}</b>\n"
         f"  💬 Команд: <b>{stats.get('total_commands',0)}</b>\n"
         f"  👤 Пользователей: <b>{len(users)}</b>\n\n"
-        f"▶️ Запуск: {last_start}\n"
-        f"⏹ Стоп: {last_stop}",
+        f"▶️ {ls} | ⏹ {lo}",
         parse_mode="HTML")
 
 
 async def cmd_connect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reg(update); await typing(update)
-    await asyncio.to_thread(update_server_info)
     await get_msg(update).reply_text(
-        f"🗺 <b>КАК ПОДКЛЮЧИТЬСЯ</b>\n\n"
+        "🗺 <b>КАК ПОДКЛЮЧИТЬСЯ</b>\n\n"
         f"🌐 Адрес: <code>{config['server_ip']}</code>\n"
         f"🔌 Порт: <code>{config['server_port']}</code>\n"
-        f"📱 Платформа: <b>Minecraft Bedrock</b>\n\n"
-        "<b>📲 Инструкция:</b>\n"
+        "📱 Платформа: Minecraft Bedrock\n\n"
+        "<b>📲 Шаги:</b>\n"
         "1. Открой Minecraft\n"
-        "2. Играть → Серверы\n"
-        "3. Добавить сервер\n"
-        f"4. Адрес: <code>{config['server_ip']}</code>\n"
-        f"5. Порт: <code>{config['server_port']}</code>\n"
-        "6. Сохрани и подключайся!\n\n"
-        f"{icon(server_status)} Сервер: <b>{server_status.upper()}</b>",
+        "2. Играть → Серверы → Добавить\n"
+        f"3. Адрес: <code>{config['server_ip']}</code>\n"
+        f"4. Порт: <code>{config['server_port']}</code>\n"
+        "5. Готово!\n\n"
+        f"{icon(server_status)} Сейчас: <b>{server_status.upper()}</b>",
         parse_mode="HTML")
 
 
@@ -461,37 +562,35 @@ async def cmd_rules(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• Строить и исследовать\n"
         "• Торговать с игроками\n"
         "• Создавать кланы\n"
-        "• PvP в специальных зонах\n\n"
+        "• PvP в арене\n\n"
         "<b>❌ Запрещено:</b>\n"
         "• Гриферство чужих построек\n"
         "• Читы и дюпы\n"
         "• Оскорбления и токсичность\n"
-        "• Спам в чате\n"
-        "• Реклама других серверов\n\n"
-        "<b>⚠️ За нарушение:</b>\n"
-        "• 1-е: предупреждение\n"
-        "• 2-е: бан 24 часа\n"
-        "• 3-е: перманентный бан\n\n"
-        "Приятной игры! 🎮",
+        "• Спам и реклама\n\n"
+        "<b>⚠️ Наказания:</b>\n"
+        "1️⃣ Предупреждение\n"
+        "2️⃣ Бан 24 часа\n"
+        "3️⃣ Перманентный бан",
         parse_mode="HTML")
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reg(update); await typing(update)
-    admin_tip = "\n🔐 /admin — панель администратора" if is_admin(update) else "\n💡 /admin — войти как администратор"
+    admin_tip = "\n🔐 /admin — панель администратора" if is_admin(update) else "\n💡 /admin — доступ для администраторов"
     await get_msg(update).reply_text(
         "<b>❓ ВСЕ КОМАНДЫ</b>\n\n"
         "<b>🌐 Сервер:</b>\n"
         "▶️ /on — запустить\n"
-        "⚙️ /status — статус\n"
-        "👥 /players — онлайн\n"
+        "⚙️ /status — статус и IP\n"
+        "👥 /players — кто онлайн\n"
         "📊 /info — статистика\n\n"
         "<b>📱 Информация:</b>\n"
         "🗺 /connect — как подключиться\n"
         "📜 /rules — правила\n"
         "🎲 /random — совет Minecraft\n"
         "⏱ /uptime — время работы\n"
-        "📅 /laststart — последний запуск"
+        "📅 /laststart — история событий"
         f"{admin_tip}",
         parse_mode="HTML")
 
@@ -500,23 +599,23 @@ async def cmd_random(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reg(update); await typing(update)
     tips = [
         "💡 Кровать устанавливает точку возрождения!",
-        "⚔️ Зачарование «Добыча III» даёт больше ресурсов!",
-        "🏠 Построй дом до первой ночи — зомби не войдут!",
+        "⚔️ Зачарование «Добыча III» — больше ресурсов!",
+        "🏠 Построй дом до первой ночи!",
         "🌾 Пшеница — основа выживания!",
         "🔥 Огниво создаёт порталы в Ад!",
-        "🧪 Зелья скорости ускоряют передвижение!",
-        "🗡 Прокачай лук — лучшее против скелетов!",
-        "🛡 Щит блокирует урон — не забудь скрафтить!",
-        "💎 Алмазы чаще на уровне Y=-58!",
-        "🐝 Пчёлы дают мёд — строй ульи рядом с фермой!",
-        "🎣 Рыбалка ночью даёт лучшие результаты!",
-        "🏔 Изумруды только в горах — торгуй с жителями!",
-        "🧊 Лёд упакованный не тает под светом!",
-        "⚡ Молния превращает свинью в свиножителя!",
-        "🌙 Спи в кровати ночью чтобы пропустить ночь!",
+        "🧪 Зелья скорости ускоряют игру!",
+        "🛡 Щит блокирует урон — скрафти его!",
+        "💎 Алмазы чаще на Y=-58!",
+        "🐝 Пчёлы дают мёд — строй ульи!",
+        "🎣 Рыбалка ночью — лучшие награды!",
+        "🏔 Изумруды только в горах!",
+        "⚡ Молния + свинья = свиножитель!",
+        "🌙 Спи ночью — пропускаешь монстров!",
+        "🧊 Лёд упакованный не тает!",
+        "🗡 Лук — лучшее оружие против скелетов!",
     ]
     await get_msg(update).reply_text(
-        f"🎲 <b>СОВЕТ ДНЯ</b>\n\n{random.choice(tips)}\n\n<i>/random — ещё совет!</i>",
+        f"🎲 <b>СОВЕТ</b>\n\n{random.choice(tips)}\n\n<i>/random — ещё!</i>",
         parse_mode="HTML")
 
 
@@ -533,13 +632,14 @@ async def cmd_uptime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_laststart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reg(update); await typing(update)
-    last = datetime.fromisoformat(stats["last_start"]).strftime("%d.%m.%Y в %H:%M") if stats.get("last_start") else "никогда"
-    last_stop = datetime.fromisoformat(stats["last_stop"]).strftime("%d.%m.%Y в %H:%M") if stats.get("last_stop") else "никогда"
+    ls = datetime.fromisoformat(stats["last_start"]).strftime("%d.%m.%Y в %H:%M") if stats.get("last_start") else "никогда"
+    lo = datetime.fromisoformat(stats["last_stop"]).strftime("%d.%m.%Y в %H:%M")  if stats.get("last_stop")  else "никогда"
     await get_msg(update).reply_text(
         f"📅 <b>ИСТОРИЯ</b>\n\n"
-        f"▶️ Запуск: <b>{last}</b>\n"
-        f"⏹ Стоп: <b>{last_stop}</b>\n"
-        f"🚀 Всего запусков: <b>{stats['starts']}</b>",
+        f"▶️ Запуск: <b>{ls}</b>\n"
+        f"⏹ Стоп: <b>{lo}</b>\n"
+        f"🚀 Всего запусков: <b>{stats['starts']}</b>\n"
+        f"🔄 Перезапусков: <b>{stats.get('restarts',0)}</b>",
         parse_mode="HTML")
 
 
@@ -548,10 +648,10 @@ async def cmd_logthischat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await get_msg(update).reply_text("🚫 <b>Только для администраторов!</b>", parse_mode="HTML")
         return
-    chat_id = update.effective_chat.id
-    config["log_chat_id"] = chat_id
+    cid = update.effective_chat.id
+    config["log_chat_id"] = cid
     save_all()
-    await update.message.reply_text(f"✅ <b>Логи здесь!</b>\nID: <code>{chat_id}</code>", parse_mode="HTML")
+    await update.message.reply_text(f"✅ <b>Логи здесь!</b>\nID: <code>{cid}</code>", parse_mode="HTML")
 
 # ══════════════════════════════════════════════════════════════════
 # CALLBACK — ЗВИЧАЙНІ КНОПКИ
@@ -560,11 +660,9 @@ async def cmd_logthischat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    handlers = {
-        "on": cmd_on, "players": cmd_players,
-        "status": cmd_status, "info": cmd_info, "connect": cmd_connect,
-    }
-    fn = handlers.get(q.data)
+    h = {"on": cmd_on, "players": cmd_players, "status": cmd_status,
+         "info": cmd_info, "connect": cmd_connect}
+    fn = h.get(q.data)
     if fn:
         await fn(update, ctx)
 
@@ -575,7 +673,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reg(update)
     if is_admin(update):
-        await show_admin_panel(update, ctx)
+        await show_admin_panel(update)
         return
     await update.message.reply_text(
         "🔐 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n\nВведите код доступа:",
@@ -589,23 +687,23 @@ async def got_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_all()
         await update.message.reply_text("✅ <b>Добро пожаловать, Администратор!</b>", parse_mode="HTML")
         await send_log(f"🔐 <b>НОВЫЙ АДМИНИСТРАТОР</b>\n👤 {ulabel(update)}\n⏰ {now_full()}")
-        await show_admin_panel(update, ctx)
+        await show_admin_panel(update)
     else:
         await update.message.reply_text("❌ <b>Неверный код!</b>", parse_mode="HTML")
-        await send_log(f"⚠️ <b>НЕУДАЧНАЯ ПОПЫТКА В АДМИНКУ</b>\n👤 {ulabel(update)}\n🔢 <code>{code}</code>")
+        await send_log(f"⚠️ <b>НЕУДАЧНАЯ ПОПЫТКА</b>\n👤 {ulabel(update)}\n🔢 <code>{code}</code>")
     return ConversationHandler.END
 
 async def cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Отменено.")
     return ConversationHandler.END
 
-async def show_admin_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def show_admin_panel(update: Update):
     await asyncio.to_thread(update_server_info)
     m = config.get("maintenance", False)
     await get_msg(update).reply_text(
         "⚙️ <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔌 Aternos: {'✅' if aternos_connected else '❌'}\n"
+        f"🔌 Aternos: {'✅ подключён' if aternos_connected else '❌ НЕТ'}\n"
         f"🖥 Сервер: {icon(server_status)} {server_status.upper()}\n"
         f"👥 Игроков: {len(current_players)}\n"
         f"👤 Пользователей: {len(users)}\n"
@@ -642,9 +740,8 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await send_log(f"🟢 <b>ЗАПУСК (ADMIN)</b>\n👤 {ulabel(update)}\n⏰ {now_full()}")
         else:
             await q.message.edit_text("❌ <b>Ошибка!</b>", reply_markup=admin_kb(), parse_mode="HTML")
-        return
 
-    if d == "adm_stop":
+    elif d == "adm_stop":
         await q.message.edit_text("⏳ <b>Останавливаю...</b>", parse_mode="HTML")
         await asyncio.to_thread(update_server_info)
         if server_status == "offline":
@@ -660,9 +757,8 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await send_log(f"🔴 <b>СТОП (ADMIN)</b>\n👤 {ulabel(update)}\n⏰ {now_full()}")
         else:
             await q.message.edit_text("❌ <b>Ошибка!</b>", reply_markup=admin_kb(), parse_mode="HTML")
-        return
 
-    if d == "adm_restart":
+    elif d == "adm_restart":
         await q.message.edit_text("⏳ <b>Перезапускаю...</b>", parse_mode="HTML")
         await asyncio.to_thread(aternos_stop)
         await asyncio.sleep(5)
@@ -674,106 +770,143 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             stats["uptime_from"] = datetime.now().isoformat()
             save_all()
             await q.message.edit_text(f"🔄 <b>ПЕРЕЗАПУЩЕН!</b>\n⏰ {now_str()}", reply_markup=admin_kb(), parse_mode="HTML")
-            await send_log(f"🔄 <b>ПЕРЕЗАПУСК (ADMIN)</b>\n👤 {ulabel(update)}")
+            await send_log(f"🔄 <b>ПЕРЕЗАПУСК (ADMIN)</b>\n👤 {ulabel(update)}\n⏰ {now_full()}")
         else:
             await q.message.edit_text("❌ <b>Ошибка!</b>", reply_markup=admin_kb(), parse_mode="HTML")
-        return
 
-    if d == "adm_broadcast":
-        ctx.user_data["waiting_broadcast"] = True
+    elif d == "adm_broadcast":
+        ctx.user_data["action"] = "broadcast"
         await q.message.reply_text(
-            "📢 <b>БРОАДКАСТ</b>\n\nНапиши сообщение для всех пользователей.\n<i>/cancel для отмены</i>",
+            "📢 <b>БРОАДКАСТ</b>\n\nНапиши сообщение — получат все пользователи.\n<i>/cancel для отмены</i>",
             parse_mode="HTML")
-        return
 
-    if d == "adm_users":
+    elif d == "adm_announce":
+        ctx.user_data["action"] = "announce"
+        await q.message.reply_text(
+            "📣 <b>АНОНС</b>\n\nНапиши текст анонса — будет красиво оформлен.\n<i>/cancel для отмены</i>",
+            parse_mode="HTML")
+
+    elif d == "adm_users":
         if not users:
             await q.message.edit_text("👥 Нет пользователей", reply_markup=admin_kb(), parse_mode="HTML")
             return
         lines = []
-        for uid, info in list(users.items())[-15:]:
+        for uid, info in list(users.items())[-20:]:
             name  = info.get("first_name", "???")
             uname = f"@{info['username']}" if info.get("username") else "—"
             try:    seen = datetime.fromisoformat(info.get("last_seen","")).strftime("%d.%m %H:%M")
             except: seen = "—"
             mark = " 🔐" if int(uid) in admins else ""
-            lines.append(f"• {name} {uname}{mark} | <i>{seen}</i>")
+            lines.append(f"• {name} {uname}{mark} <i>{seen}</i>")
         await q.message.edit_text(
             f"👥 <b>ПОЛЬЗОВАТЕЛИ ({len(users)})</b>\n\n" + "\n".join(lines),
             reply_markup=admin_kb(), parse_mode="HTML")
-        return
 
-    if d == "adm_stats":
+    elif d == "adm_stats":
         await asyncio.to_thread(update_server_info)
-        last_start = datetime.fromisoformat(stats["last_start"]).strftime("%d.%m %H:%M") if stats.get("last_start") else "никогда"
-        last_stop  = datetime.fromisoformat(stats["last_stop"]).strftime("%d.%m %H:%M")  if stats.get("last_stop")  else "никогда"
+        ls = datetime.fromisoformat(stats["last_start"]).strftime("%d.%m %H:%M") if stats.get("last_start") else "—"
+        lo = datetime.fromisoformat(stats["last_stop"]).strftime("%d.%m %H:%M")  if stats.get("last_stop")  else "—"
         await q.message.edit_text(
-            "📊 <b>СТАТИСТИКА</b>\n\n"
+            "📊 <b>ПОЛНАЯ СТАТИСТИКА</b>\n\n"
             f"🚀 Запусков: <b>{stats['starts']}</b>\n"
             f"🛑 Остановок: <b>{stats['stops']}</b>\n"
             f"🔄 Перезапусков: <b>{stats.get('restarts',0)}</b>\n"
-            f"👑 Пик: <b>{stats['peak_players']}</b>\n"
+            f"👑 Пик игроков: <b>{stats['peak_players']}</b>\n"
             f"⏱ Аптайм: <b>{get_uptime()}</b>\n"
             f"💬 Команд: <b>{stats.get('total_commands',0)}</b>\n"
-            f"👤 Пользователей: <b>{len(users)}</b>\n\n"
-            f"▶️ {last_start} | ⏹ {last_stop}",
+            f"👤 Пользователей: <b>{len(users)}</b>\n"
+            f"🔐 Админов: <b>{len(admins)}</b>\n\n"
+            f"▶️ {ls} | ⏹ {lo}\n"
+            f"⏰ {now_full()}",
             reply_markup=admin_kb(), parse_mode="HTML")
-        return
 
-    if d == "adm_maintenance":
+    elif d == "adm_resetstats":
+        stats.update({"starts":0,"stops":0,"restarts":0,"last_start":None,"last_stop":None,"uptime_from":None,"peak_players":0,"total_commands":0})
+        save_all()
+        await q.message.edit_text("🗑 <b>Статистика сброшена!</b>", reply_markup=admin_kb(), parse_mode="HTML")
+        await send_log(f"🗑 <b>СТАТИСТИКА СБРОШЕНА</b>\n👤 {ulabel(update)}")
+
+    elif d == "adm_maintenance":
         config["maintenance"] = not config.get("maintenance", False)
         save_all()
         word = "ВКЛ 🟡" if config["maintenance"] else "ВЫКЛ 🟢"
         await q.message.edit_text(f"🔧 <b>Техобслуживание {word}</b>", reply_markup=admin_kb(), parse_mode="HTML")
         await send_log(f"🔧 Техобслуживание {word}\n👤 {ulabel(update)}")
-        return
 
-    if d == "adm_reconnect":
-        await q.message.edit_text("⏳ <b>Переподключаюсь...</b>", parse_mode="HTML")
+    elif d == "adm_reconnect":
+        await q.message.edit_text("⏳ <b>Переподключаюсь к Aternos...</b>", parse_mode="HTML")
         ok = await asyncio.to_thread(aternos_login)
-        result = "✅ Подключён!" if ok else "❌ Не удалось"
-        await q.message.edit_text(f"🔌 <b>Aternos: {result}</b>", reply_markup=admin_kb(), parse_mode="HTML")
-        await send_log(f"🔌 Переподключение: {result}\n👤 {ulabel(update)}")
-        return
+        r = "✅ Подключён!" if ok else "❌ Не удалось. Возможно нужны куки (ATERNOS_COOKIES)"
+        await q.message.edit_text(f"🔌 <b>{r}</b>", reply_markup=admin_kb(), parse_mode="HTML")
+        await send_log(f"🔌 Переподключение: {r}\n👤 {ulabel(update)}")
 
-    if d == "adm_setlog":
+    elif d == "adm_setlog":
         cid = q.message.chat_id
         config["log_chat_id"] = cid
         save_all()
         await q.message.edit_text(f"✅ <b>Логи здесь!</b>\nID: <code>{cid}</code>", reply_markup=admin_kb(), parse_mode="HTML")
-        return
 
-    if d == "adm_exit":
+    elif d == "adm_session":
+        cookies_set = bool(os.getenv("ATERNOS_COOKIES"))
+        await q.message.edit_text(
+            "🍪 <b>ИНФОРМАЦИЯ О СЕССИИ</b>\n\n"
+            f"🔌 Aternos: {'✅ подключён' if aternos_connected else '❌ нет'}\n"
+            f"🍪 Куки (ATERNOS_COOKIES): {'✅ установлены' if cookies_set else '❌ нет'}\n\n"
+            "<b>Как исправить логин:</b>\n"
+            "1. Открой браузер на ПК\n"
+            "2. Войди в aternos.org\n"
+            "3. F12 → Application → Cookies → aternos.org\n"
+            "4. Скопируй все куки в JSON формат\n"
+            "5. Добавь в Railway как переменную <code>ATERNOS_COOKIES</code>",
+            reply_markup=admin_kb(), parse_mode="HTML")
+
+    elif d == "adm_exit":
         await q.message.edit_text("👋 <b>Панель закрыта.</b>", parse_mode="HTML")
-        return
 
 # ══════════════════════════════════════════════════════════════════
-# БРОАДКАСТ
+# БРОАДКАСТ / АНОНС — ОБРОБКА ТЕКСТУ
 # ══════════════════════════════════════════════════════════════════
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.user_data.get("waiting_broadcast") or not is_admin(update):
+    action = ctx.user_data.get("action")
+    if not action or not is_admin(update):
         return
     text = update.message.text.strip()
     if text.startswith("/cancel"):
-        ctx.user_data["waiting_broadcast"] = False
+        ctx.user_data["action"] = None
         await update.message.reply_text("❌ Отменено.")
         return
-    ctx.user_data["waiting_broadcast"] = False
-    broadcast_text = f"📢 <b>ОБЪЯВЛЕНИЕ — {config['server_name']}</b>\n\n{text}\n\n<i>— Администрация</i>"
+
+    ctx.user_data["action"] = None
+
+    if action == "broadcast":
+        msg_text = (
+            f"📢 <b>ОБЪЯВЛЕНИЕ — {config['server_name']}</b>\n\n"
+            f"{text}\n\n<i>— Администрация</i>"
+        )
+    else:  # announce
+        msg_text = (
+            f"📣 <b>━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            f"🎮 <b>{config['server_name'].upper()}</b>\n\n"
+            f"{text}\n\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━</b>"
+        )
+
     sent = failed = 0
     status_msg = await update.message.reply_text("⏳ <b>Отправляю...</b>", parse_mode="HTML")
     for uid in list(users.keys()):
         try:
-            await telegram_app.bot.send_message(int(uid), broadcast_text, parse_mode="HTML")
+            await telegram_app.bot.send_message(int(uid), msg_text, parse_mode="HTML")
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
             failed += 1
     await status_msg.edit_text(
-        f"📢 <b>Броадкаст отправлен!</b>\n✅ {sent} | ❌ {failed}",
+        f"{'📢' if action=='broadcast' else '📣'} <b>Отправлено!</b>\n✅ {sent} | ❌ {failed}",
         parse_mode="HTML")
-    await send_log(f"📢 <b>БРОАДКАСТ</b>\n👤 {ulabel(update)}\n✅{sent}/❌{failed}\n<i>{text[:200]}</i>")
+    await send_log(
+        f"{'📢 БРОАДКАСТ' if action=='broadcast' else '📣 АНОНС'}\n"
+        f"👤 {ulabel(update)}\n✅{sent}/❌{failed}\n<i>{text[:200]}</i>")
 
 # ══════════════════════════════════════════════════════════════════
 # АВТО-ОТЧЁТ
@@ -789,10 +922,10 @@ async def auto_report():
         try:
             pl_str = "\n".join(f"  • {p}" for p in current_players) if current_players else "  (никого)"
             await send_log(
-                "🟢 <b>АВТООТЧЁТ</b>\n"
+                f"🟢 <b>АВТООТЧЁТ</b>\n"
                 f"⏰ {now_full()}\n"
-                f"⏱ Аптайм: {get_uptime()}\n"
-                f"👥 Игроки ({len(current_players)}):\n{pl_str}")
+                f"⏱ {get_uptime()}\n"
+                f"👥 ({len(current_players)}):\n{pl_str}")
         except Exception as e:
             log.error(f"❌ auto_report: {e}")
 
@@ -804,7 +937,11 @@ flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def index():
-    return jsonify({"status":"ok","server":server_status,"players":len(current_players),"aternos":aternos_connected}), 200
+    return jsonify({
+        "status": "ok", "version": "12.0",
+        "server": server_status, "players": len(current_players),
+        "aternos": aternos_connected,
+    }), 200
 
 @flask_app.route("/ping")
 def ping():
@@ -819,6 +956,7 @@ def run_flask():
 
 async def main():
     global telegram_app
+
     load_all()
     await asyncio.to_thread(aternos_login)
 
@@ -851,6 +989,7 @@ async def main():
     await telegram_app.start()
     await telegram_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
