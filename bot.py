@@ -99,7 +99,7 @@ def reg(update: Update):
 # ══════════════════════════════════════════════════════════════════
 
 async def aternos_login() -> bool:
-    """Playwright логін — запускається один раз, витягує cookies"""
+    """Playwright логін з очікуванням Cloudflare і діагностикою"""
     global aternos_connected, aternos_session
     if not all([ATERNOS_USER, ATERNOS_PASS]):
         log.warning("⚠️ Aternos дані не вказані")
@@ -109,65 +109,137 @@ async def aternos_login() -> bool:
         log.info("🔑 Playwright: логінюсь в Aternos...")
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=[
-                "--no-sandbox","--disable-setuid-sandbox",
-                "--disable-gpu","--disable-dev-shm-usage",
-                "--disable-extensions","--disable-background-networking",
-            ])
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ]
+            )
             ctx = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 720},
+                locale="en-US",
             )
             page = await ctx.new_page()
 
-            log.info("   Відкриваю /go/ ...")
-            await page.goto("https://aternos.org/go/", wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(2)
+            # Прибираємо ознаки headless
+            await page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
 
-            log.info("   Заповнюю форму...")
-            await page.fill("input[name='user']", ATERNOS_USER)
+            log.info("   Відкриваю aternos.org/go/ ...")
+            await page.goto(
+                "https://aternos.org/go/",
+                wait_until="networkidle",
+                timeout=60000
+            )
+
+            # Чекаємо Cloudflare
+            log.info("   Чекаю Cloudflare (5 сек)...")
+            await asyncio.sleep(5)
+
+            current_url = page.url
+            title = await page.title()
+            log.info(f"   URL: {current_url} | Title: {title}")
+
+            # Пробуємо знайти поле user різними способами
+            selectors_user = [
+                "input[name='user']",
+                "input[type='text']",
+                "#user",
+                "input[placeholder*='user' i]",
+                "input[placeholder*='name' i]",
+                "input[autocomplete*='user' i]",
+            ]
+
+            user_field = None
+            for sel in selectors_user:
+                try:
+                    await page.wait_for_selector(sel, timeout=3000, state="visible")
+                    user_field = sel
+                    log.info(f"   ✅ Поле знайдено: {sel}")
+                    break
+                except Exception:
+                    log.info(f"   Не знайдено: {sel}")
+
+            if not user_field:
+                html = await page.content()
+                log.error(f"   Форма не знайдена! HTML: {html[:800]}")
+                await send_log(
+                    "❌ <b>Форма логіну не знайдена!</b>\n\n"
+                    f"URL: <code>{current_url}</code>\n"
+                    f"Title: <code>{title}</code>\n\n"
+                    f"<code>{html[:400]}</code>"
+                )
+                await browser.close()
+                return False
+
+            # Вводимо логін
+            log.info("   Вводжу логін...")
+            await page.fill(user_field, ATERNOS_USER)
             await asyncio.sleep(0.5)
-            await page.fill("input[name='password']", ATERNOS_PASS)
+
+            # Вводимо пароль
+            for sel in ["input[name='password']", "input[type='password']"]:
+                try:
+                    await page.wait_for_selector(sel, timeout=3000, state="visible")
+                    await page.fill(sel, ATERNOS_PASS)
+                    log.info(f"   ✅ Пароль введено: {sel}")
+                    break
+                except Exception:
+                    pass
+
             await asyncio.sleep(0.5)
-            await page.click("button[type='submit']")
 
-            log.info("   Чекаю редіректу...")
-            try:
-                await page.wait_for_url("**/servers**", timeout=20000)
-            except:
-                # Пробуємо перевірити чи ми на правильній сторінці
-                url = page.url
-                log.info(f"   Поточний URL: {url}")
-                if "server" not in url:
-                    log.error("❌ Логін не вдався — невірний логін/пароль або Cloudflare")
-                    await browser.close()
-                    return False
+            # Натискаємо кнопку
+            for sel in ["button[type='submit']", "button:has-text('Login')", ".login-button"]:
+                try:
+                    await page.wait_for_selector(sel, timeout=2000, state="visible")
+                    await page.click(sel)
+                    log.info(f"   ✅ Кнопка: {sel}")
+                    break
+                except Exception:
+                    pass
 
-            # Витягуємо ВСІ cookies
+            log.info("   Чекаю після входу (5 сек)...")
+            await asyncio.sleep(5)
+
+            final_url = page.url
             cookies = await ctx.cookies()
             aternos_session = {c["name"]: c["value"] for c in cookies}
-            log.info(f"   Отримано {len(aternos_session)} cookies")
-
-            # Шукаємо ATERNOS_SESSION
-            if "ATERNOS_SESSION" in aternos_session:
-                log.info(f"   ✅ ATERNOS_SESSION: {aternos_session['ATERNOS_SESSION'][:20]}...")
-            else:
-                log.warning(f"   ⚠️ ATERNOS_SESSION не знайдено, куки: {list(aternos_session.keys())}")
+            log.info(f"   Фінальний URL: {final_url}")
+            log.info(f"   Куки: {list(aternos_session.keys())}")
 
             await browser.close()
-            # Playwright закривається — звільняємо пам'ять!
 
-        aternos_connected = True
-        log.info("✅ Логін успішний! Браузер закрито, далі — WebSocket")
-        return True
+        if "server" in final_url or "ATERNOS_SESSION" in aternos_session:
+            aternos_connected = True
+            log.info("✅ Aternos логін успішний!")
+            return True
+        else:
+            log.error(f"❌ Логін не вдався: {final_url}")
+            await send_log(
+                f"❌ <b>Логін не вдався</b>\n"
+                f"URL: <code>{final_url}</code>\n"
+                f"Куки: <code>{list(aternos_session.keys())}</code>"
+            )
+            return False
 
     except ImportError:
         log.warning("⚠️ Playwright не встановлено")
         return False
     except Exception as e:
         log.error(f"❌ Playwright login: {e}", exc_info=True)
+        await send_log(f"❌ <b>Помилка Playwright:</b>\n<code>{str(e)[:300]}</code>")
         return False
-
-
 def _cookie_header() -> str:
     """Формує cookie header для запитів"""
     return "; ".join(f"{k}={v}" for k, v in aternos_session.items())
@@ -704,6 +776,20 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sm.edit_text(f"✅ Отправлено: {sent} | ❌ Не доставлено: {failed}", parse_mode="HTML")
     await send_log(f"{'📢' if action=='broadcast' else '📣'} {ulabel(update)}\n✅{sent}/❌{failed}")
 
+async def _background_login():
+    """Логін в Aternos у фоні після старту бота"""
+    await asyncio.sleep(3)
+    log.info("🔑 Фоновий логін...")
+    try:
+        ok = await aternos_login()
+        if ok:
+            await send_log("✅ <b>Aternos підключено!</b>")
+        else:
+            await send_log("❌ <b>Aternos не підключено!</b>\n\nПеревір ATERNOS_USER, ATERNOS_PASS і Playwright.")
+    except Exception as e:
+        log.error(f"❌ bg_login: {e}", exc_info=True)
+        await send_log(f"❌ <b>Помилка:</b>\n<code>{str(e)[:300]}</code>")
+
 async def auto_report():
     await asyncio.sleep(60)
     while True:
@@ -735,7 +821,8 @@ def run_flask():
 async def main():
     global telegram_app
     load_all()
-    await aternos_login()
+    # Логін запускається в фоні щоб не блокувати старт бота
+    asyncio.create_task(_background_login())
 
     telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
