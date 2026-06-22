@@ -154,7 +154,8 @@ async def aternos_login() -> bool:
 
         # Додаємо куки вручну
         for c in cookies:
-            aternos_session.cookie_jar.update_cookies({c['name']: c['value']}, response_url="https://aternos.org/")
+            from yarl import URL as _URL
+        aternos_session.cookie_jar.update_cookies({c['name']: c['value']}, response_url=_URL("https://aternos.org/"))
 
         log.info("✅ Aternos підключено! (aiohttp сесія з cookies)")
         aternos_connected = True
@@ -501,7 +502,7 @@ async def main():
 
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await telegram_app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
