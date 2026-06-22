@@ -86,29 +86,110 @@ async def aternos_login() -> bool:
         from playwright.async_api import async_playwright
         log.info("🔑 Playwright: логінюсь...")
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=[
-                "--no-sandbox","--disable-setuid-sandbox","--disable-gpu","--disable-dev-shm-usage"
-            ])
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--flag-switches-begin",
+                    "--disable-site-isolation-trials",
+                    "--flag-switches-end",
+                ]
+            )
             ctx = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                viewport={"width":1920,"height":1080},
+                locale="en-US",
+                timezone_id="Europe/Kiev",
+                extra_http_headers={
+                    "Accept-Language":"en-US,en;q=0.9",
+                    "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "sec-ch-ua":'"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                    "sec-ch-ua-platform":'"Windows"',
+                    "sec-ch-ua-mobile":"?0",
+                }
             )
             page = await ctx.new_page()
-            await page.goto("https://aternos.org/go/", wait_until="networkidle", timeout=60000)
-            await asyncio.sleep(5)
 
-            for sel in ["input[name='user']","input[type='text']"]:
-                try: await page.wait_for_selector(sel,timeout=3000); await page.fill(sel,ATERNOS_USER); break
-                except: pass
-            for sel in ["input[name='password']","input[type='password']"]:
-                try: await page.wait_for_selector(sel,timeout=3000); await page.fill(sel,ATERNOS_PASS); break
-                except: pass
-            for sel in ["button[type='submit']","button:has-text('Login')"]:
-                try: await page.click(sel); break
+            # Маскуємо headless
+            await ctx.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get:()=>undefined});
+                Object.defineProperty(navigator, 'plugins', {get:()=>({length:3})});
+                Object.defineProperty(navigator, 'languages', {get:()=>['en-US','en']});
+                window.chrome = {runtime:{}};
+                Object.defineProperty(navigator, 'permissions', {
+                    get:()=>({query:()=>Promise.resolve({state:'granted'})})
+                });
+            """)
+
+            log.info("   Відкриваю aternos.org/go/ ...")
+            await page.goto("https://aternos.org/go/", wait_until="domcontentloaded", timeout=60000)
+
+            # Чекаємо поки Cloudflare Turnstile пройде (до 30 сек)
+            log.info("   Чекаю Cloudflare Turnstile...")
+            for i in range(30):
+                await asyncio.sleep(1)
+                url = page.url
+                title = await page.title()
+                log.info(f"   [{i+1}с] URL: {url[:60]} | Title: {title[:40]}")
+
+                # Якщо Turnstile пройшов — шукаємо форму
+                has_form = await page.query_selector("input[name='user']")
+                has_turnstile = await page.query_selector("input[name='cf-turnstile-response']")
+                if has_form:
+                    log.info("   ✅ Форма знайдена!")
+                    break
+                if has_turnstile:
+                    log.info("   ⏳ Turnstile ще не пройшов...")
+            else:
+                log.error("   ❌ Turnstile не пройшов за 30 сек")
+                html = await page.content()
+                log.error(f"   HTML: {html[:300]}")
+                await browser.close()
+                return False
+
+            # Вводимо дані повільно як людина
+            log.info("   Вводжу логін...")
+            await page.click("input[name='user']")
+            await asyncio.sleep(0.3)
+            for char in ATERNOS_USER:
+                await page.type("input[name='user']", char, delay=random.randint(50,150))
+
+            await asyncio.sleep(0.5)
+
+            log.info("   Вводжу пароль...")
+            await page.click("input[name='password']")
+            await asyncio.sleep(0.3)
+            for char in ATERNOS_PASS:
+                await page.type("input[name='password']", char, delay=random.randint(50,150))
+
+            await asyncio.sleep(0.5)
+
+            # Клік на кнопку
+            for sel in ["button[type='submit']","button:has-text('Login')","button:has-text('Log in')"]:
+                try:
+                    await page.wait_for_selector(sel, timeout=2000, state="visible")
+                    await page.click(sel)
+                    log.info(f"   ✅ Кнопка: {sel}")
+                    break
                 except: pass
 
-            await asyncio.sleep(5)
+            # Чекаємо редіректу
+            log.info("   Чекаю після логіну...")
+            for i in range(15):
+                await asyncio.sleep(1)
+                url = page.url
+                if "server" in url:
+                    log.info(f"   ✅ Залогінились! URL: {url}")
+                    break
+                log.info(f"   [{i+1}с] {url[:60]}")
+
             cookies = await ctx.cookies()
-            log.info(f"   Отримано {len(cookies)} cookies")
+            log.info(f"   Отримано {len(cookies)} cookies: {[c['name'] for c in cookies[:10]]}")
             await browser.close()
 
         # Створюємо aiohttp сесію з cookies
