@@ -41,9 +41,14 @@ telegram_app=None; http_session=None; aternos_connected=False; last_login_time=0
 server_status="offline"; current_players=[]; login_cookies={}
 
 WAIT_CODE=1; WAIT_BROADCAST=2; WAIT_ANNOUNCE=3; WAIT_MOTD=4; WAIT_SEED=5; WAIT_SHOP=6; WAIT_NOTE=7; WAIT_WARN=8
-WAIT_COOKIE=9; WAIT_WATCH_URL=10
+WAIT_COOKIE=9; WAIT_WATCH_URL=10; WAIT_WATCH_USER=11; WAIT_WATCH_PASS=12; WAIT_WATCH_SPEED=13; WAIT_WATCH_NAV=14
 
-watch_sessions: dict = {}   # chat_id -> {"url": str, "interval": int, "task": Task}
+# watch_sessions: chat_id -> {
+#   url, interval, task, auto_login(bool),
+#   w_user, w_pass,  # ручні кред для watch
+#   last_msg_id,     # id останнього повідомлення зі скріном
+# }
+watch_sessions: dict = {}
 
 # ══════════════════════════════════════════════════════════════════
 # ЛОКАЛІЗАЦІЯ (РУ)
@@ -533,9 +538,8 @@ def admin_kb():
         [InlineKeyboardButton("🍪 Ввести куки", callback_data="adm_set_cookie"),
          InlineKeyboardButton("🔍 Диагностика", callback_data="adm_diagnose")],
         [InlineKeyboardButton("📸 Скриншот", callback_data="adm_screenshot"),
-         InlineKeyboardButton("👁 Watch", callback_data="adm_watch")],
-        [InlineKeyboardButton("📋 Консоль", callback_data="adm_console"),
-         InlineKeyboardButton("🛑 Стоп Watch", callback_data="adm_watch_stop")],
+         InlineKeyboardButton("👁 Watch панель", callback_data="adm_watch_panel")],
+        [InlineKeyboardButton("📋 Консоль", callback_data="adm_console")],
         [InlineKeyboardButton("━━━ 👥 ИГРОКИ ━━━", callback_data="noop")],
         [InlineKeyboardButton("👥 Список", callback_data="adm_users"),
          InlineKeyboardButton("⚠️ Варны", callback_data="adm_warns")],
@@ -555,9 +559,41 @@ def admin_kb():
         [InlineKeyboardButton("❌ Закрыть", callback_data="adm_exit")],
     ])
 
-# ══════════════════════════════════════════════════════════════════
-# КОМАНДИ КОРИСТУВАЧА
-# ══════════════════════════════════════════════════════════════════
+def watch_kb(chat_id: int):
+    sess = watch_sessions.get(chat_id, {})
+    interval = sess.get("interval", 20)
+    auto = sess.get("auto_login", True)
+    running = sess.get("task") and not sess["task"].done() if sess.get("task") else False
+    auto_label = "🤖 Авто" if auto else "✋ Вручну"
+    run_label = "🛑 Зупинити" if running else "▶️ Запустити"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("━━━ 👁 WATCH ПАНЕЛЬ ━━━", callback_data="noop")],
+        [InlineKeyboardButton(f"{'🟢 Активний' if running else '🔴 Зупинено'}", callback_data="noop")],
+        [InlineKeyboardButton(run_label, callback_data="watch_toggle"),
+         InlineKeyboardButton("📸 Знімок зараз", callback_data="watch_snap")],
+        [InlineKeyboardButton("━━━ ⚡ ШВИДКІСТЬ ━━━", callback_data="noop")],
+        [InlineKeyboardButton("10с", callback_data="watch_spd_10"),
+         InlineKeyboardButton("20с" + (" ✅" if interval==20 else ""), callback_data="watch_spd_20"),
+         InlineKeyboardButton("30с" + (" ✅" if interval==30 else ""), callback_data="watch_spd_30"),
+         InlineKeyboardButton("60с" + (" ✅" if interval==60 else ""), callback_data="watch_spd_60")],
+        [InlineKeyboardButton("✏️ Своя швидкість", callback_data="watch_spd_custom")],
+        [InlineKeyboardButton("━━━ 🔑 АВТОРИЗАЦІЯ ━━━", callback_data="noop")],
+        [InlineKeyboardButton(f"Режим: {auto_label}", callback_data="watch_toggle_auth"),
+         InlineKeyboardButton("🔍 Діагностика", callback_data="watch_diagnose")],
+        [InlineKeyboardButton("👤 Ввести логін", callback_data="watch_set_user"),
+         InlineKeyboardButton("🔐 Ввести пароль", callback_data="watch_set_pass")],
+        [InlineKeyboardButton("🍪 Ввести куки", callback_data="adm_set_cookie")],
+        [InlineKeyboardButton("━━━ 🗺 НАВІГАЦІЯ ━━━", callback_data="noop")],
+        [InlineKeyboardButton("🏠 Головна", callback_data="watch_nav_home"),
+         InlineKeyboardButton("🔑 Логін", callback_data="watch_nav_login"),
+         InlineKeyboardButton("🖥 Сервер", callback_data="watch_nav_server")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="watch_nav_back"),
+         InlineKeyboardButton("▶️ Вперед", callback_data="watch_nav_fwd"),
+         InlineKeyboardButton("🔄 Оновити", callback_data="watch_nav_reload")],
+        [InlineKeyboardButton("✏️ Свій URL", callback_data="watch_set_url")],
+        [InlineKeyboardButton("━━━━━━━━━━━━━━━━━━━━━━", callback_data="noop")],
+        [InlineKeyboardButton("🔙 Назад до /admin", callback_data="watch_back_admin")],
+    ])
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not reg(update):
@@ -1065,28 +1101,134 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=admin_kb(), parse_mode="HTML"
         )
 
-    elif d == "adm_watch":
+    elif d == "adm_watch_panel":
+        await show_watch_panel(update, q.message)
+
+    elif d == "watch_back_admin":
+        await show_admin_panel(update)
+
+    elif d == "watch_toggle":
+        chat_id = q.message.chat_id
+        sess = watch_sessions.get(chat_id, {})
+        task = sess.get("task")
+        if task and not task.done():
+            task.cancel()
+            watch_sessions.get(chat_id, {}).pop("task", None)
+            if chat_id in watch_sessions:
+                watch_sessions[chat_id]["task"] = None
+            await q.message.edit_text("🛑 <b>Watch зупинено!</b>", reply_markup=watch_kb(chat_id), parse_mode="HTML")
+        else:
+            if chat_id not in watch_sessions:
+                watch_sessions[chat_id] = {"interval": 20, "auto_login": True, "url": f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/"}
+            new_task = asyncio.create_task(_watch_loop(chat_id))
+            watch_sessions[chat_id]["task"] = new_task
+            await q.message.edit_text("▶️ <b>Watch запущено!</b>", reply_markup=watch_kb(chat_id), parse_mode="HTML")
+
+    elif d == "watch_snap":
+        chat_id = q.message.chat_id
+        await q.message.reply_text("📸 <b>Роблю знімок...</b>", parse_mode="HTML")
+        if chat_id not in watch_sessions:
+            watch_sessions[chat_id] = {"interval": 20, "auto_login": True, "url": f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/"}
+        await _take_and_send_screenshot(chat_id, q.message.chat_id)
+
+    elif d in ("watch_spd_10", "watch_spd_20", "watch_spd_30", "watch_spd_60"):
+        chat_id = q.message.chat_id
+        spd = int(d.split("_")[-1])
+        if chat_id not in watch_sessions:
+            watch_sessions[chat_id] = {"interval": spd, "auto_login": True, "url": f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/"}
+        else:
+            watch_sessions[chat_id]["interval"] = spd
+        await q.message.edit_text(f"⚡ <b>Швидкість: {spd} сек</b>", reply_markup=watch_kb(chat_id), parse_mode="HTML")
+
+    elif d == "watch_spd_custom":
+        ctx.user_data["action"] = "watch_speed"
+        await q.message.reply_text("✏️ <b>Введи інтервал в секундах (5–300):</b>\n<i>/cancel — скасувати</i>", parse_mode="HTML")
+
+    elif d == "watch_toggle_auth":
+        chat_id = q.message.chat_id
+        if chat_id not in watch_sessions:
+            watch_sessions[chat_id] = {"interval": 20, "auto_login": True, "url": f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/"}
+        cur = watch_sessions[chat_id].get("auto_login", True)
+        watch_sessions[chat_id]["auto_login"] = not cur
+        label = "🤖 Авто" if not cur else "✋ Вручну"
+        await q.message.edit_text(f"🔑 <b>Режим авторизації: {label}</b>", reply_markup=watch_kb(chat_id), parse_mode="HTML")
+
+    elif d == "watch_set_user":
+        ctx.user_data["action"] = "watch_user"
+        await q.message.reply_text(
+            "👤 <b>Введи логін для Watch:</b>\n\n"
+            "<i>Це окремо від основного ATERNOS_USER.\n"
+            "Залиш порожнім для використання env змінної.\n"
+            "/cancel — скасувати</i>",
+            parse_mode="HTML"
+        )
+
+    elif d == "watch_set_pass":
+        ctx.user_data["action"] = "watch_pass"
+        await q.message.reply_text(
+            "🔐 <b>Введи пароль для Watch:</b>\n\n"
+            "<i>Це окремо від основного ATERNOS_PASS.\n"
+            "Залиш порожнім для використання env змінної.\n"
+            "/cancel — скасувати</i>",
+            parse_mode="HTML"
+        )
+
+    elif d == "watch_set_url":
         ctx.user_data["action"] = "watch_url"
         await q.message.reply_text(
-            "👁 <b>WATCH — моніторинг екрану</b>\n\n"
-            "Введи URL для стеження (або натисни скасувати для стандартного):\n\n"
-            "• <code>https://aternos.org/server/</code> — панель сервера\n"
-            "• <code>https://aternos.org/go/</code> — сторінка логіну\n"
-            "• <code>default</code> — автоматично\n\n"
+            "🔗 <b>Введи URL для Watch:</b>\n\n"
+            "• <code>https://aternos.org/server/</code>\n"
+            "• <code>https://aternos.org/go/</code>\n"
+            "• Або будь-який інший URL\n\n"
             "<i>/cancel — скасувати</i>",
             parse_mode="HTML"
         )
 
-    elif d == "adm_watch_stop":
+    elif d == "watch_diagnose":
         chat_id = q.message.chat_id
-        if chat_id in watch_sessions:
-            task = watch_sessions[chat_id].get("task")
-            if task and not task.done():
-                task.cancel()
-            del watch_sessions[chat_id]
-            await q.message.edit_text("🛑 <b>Watch зупинено!</b>", reply_markup=admin_kb(), parse_mode="HTML")
-        else:
-            await q.message.edit_text("ℹ️ Watch не запущено", reply_markup=admin_kb(), parse_mode="HTML")
+        sess = watch_sessions.get(chat_id, {})
+        running = sess.get("task") and not sess["task"].done()
+        w_user = sess.get("w_user") or "(з env)"
+        w_pass = "***" if sess.get("w_pass") else "(з env)"
+        auto = sess.get("auto_login", True)
+        lines = [
+            f"👁 Watch: <b>{'🟢 Активний' if running else '🔴 Зупинено'}</b>",
+            f"⚡ Інтервал: <b>{sess.get('interval', 20)} сек</b>",
+            f"🔑 Режим: <b>{'🤖 Авто' if auto else '✋ Вручну'}</b>",
+            f"👤 Логін: <b>{w_user}</b>",
+            f"🔐 Пароль: <b>{w_pass}</b>",
+            f"🔗 URL: <code>{sess.get('url', '—')}</code>",
+            f"🍪 Куків: <b>{len(login_cookies)}</b>",
+            f"🔌 Aternos: <b>{'✅' if aternos_connected else '❌'}</b>",
+        ]
+        await q.message.edit_text(
+            "🔍 <b>WATCH ДІАГНОСТИКА</b>\n\n" + "\n".join(lines),
+            reply_markup=watch_kb(chat_id), parse_mode="HTML"
+        )
+
+    elif d in ("watch_nav_home", "watch_nav_login", "watch_nav_server", "watch_nav_back", "watch_nav_fwd", "watch_nav_reload"):
+        chat_id = q.message.chat_id
+        if chat_id not in watch_sessions:
+            watch_sessions[chat_id] = {"interval": 20, "auto_login": True, "url": "https://aternos.org/go/"}
+        nav_map = {
+            "watch_nav_home":   "https://aternos.org/",
+            "watch_nav_login":  "https://aternos.org/go/",
+            "watch_nav_server": f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/servers/",
+        }
+        if d in nav_map:
+            watch_sessions[chat_id]["url"] = nav_map[d]
+            await q.message.reply_text(f"🗺 <b>URL змінено:</b>\n<code>{nav_map[d]}</code>", parse_mode="HTML")
+        elif d == "watch_nav_reload":
+            pass  # просто робимо знімок поточного
+        elif d in ("watch_nav_back", "watch_nav_fwd"):
+            await q.message.reply_text(
+                "ℹ️ Навігація назад/вперед доступна тільки в активному Watch.\n"
+                "Запусти Watch і використовуй кнопки під час трансляції.",
+                parse_mode="HTML"
+            )
+            return
+        await q.message.reply_text("📸 <b>Роблю знімок...</b>", parse_mode="HTML")
+        await _take_and_send_screenshot(chat_id, chat_id)
 
     elif d == "adm_broadcast":
         ctx.user_data["action"] = "broadcast"
@@ -1357,23 +1499,56 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action == "watch_url":
         ctx.user_data["action"] = None
         chat_id = update.effective_chat.id
-        if text.strip().lower() == "default" or text.strip() == "":
-            url = f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/"
-        else:
-            url = text.strip()
-        # Зупиняємо попередній watch якщо є
-        if chat_id in watch_sessions:
-            old_task = watch_sessions[chat_id].get("task")
-            if old_task and not old_task.done():
-                old_task.cancel()
-        sm = await update.message.reply_text(
-            f"👁 <b>Watch запускається...</b>\n🔗 <code>{url}</code>\n\n"
-            f"Скріншоти кожні 30 секунд.\n<i>Зупинити: /admin → 🛑 Стоп Watch</i>",
+        url = text.strip() if text.strip() else (f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/")
+        if chat_id not in watch_sessions:
+            watch_sessions[chat_id] = {"interval": 20, "auto_login": True}
+        watch_sessions[chat_id]["url"] = url
+        await update.message.reply_text(f"✅ <b>URL встановлено:</b>\n<code>{url}</code>", parse_mode="HTML")
+        await show_watch_panel(update, update.message)
+
+    elif action == "watch_user":
+        ctx.user_data["action"] = None
+        chat_id = update.effective_chat.id
+        if chat_id not in watch_sessions:
+            watch_sessions[chat_id] = {"interval": 20, "auto_login": False, "url": f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/"}
+        watch_sessions[chat_id]["w_user"] = text.strip()
+        watch_sessions[chat_id]["auto_login"] = False
+        await update.message.reply_text(
+            f"✅ <b>Логін збережено!</b>\n👤 <code>{text.strip()}</code>\n\n"
+            f"Режим автоматично переключено на ✋ Вручну",
             parse_mode="HTML"
         )
-        task = asyncio.create_task(_watch_loop(chat_id, url))
-        watch_sessions[chat_id] = {"url": url, "task": task}
-        await send_log(f"👁 <b>WATCH</b>\n👤 {ulabel(update)}\n🔗 {url}")
+        await show_watch_panel(update, update.message)
+
+    elif action == "watch_pass":
+        ctx.user_data["action"] = None
+        chat_id = update.effective_chat.id
+        if chat_id not in watch_sessions:
+            watch_sessions[chat_id] = {"interval": 20, "auto_login": False, "url": f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/"}
+        watch_sessions[chat_id]["w_pass"] = text.strip()
+        watch_sessions[chat_id]["auto_login"] = False
+        await update.message.reply_text(
+            f"✅ <b>Пароль збережено!</b>\n🔐 {'*' * min(len(text.strip()), 8)}\n\n"
+            f"Режим автоматично переключено на ✋ Вручну",
+            parse_mode="HTML"
+        )
+        await show_watch_panel(update, update.message)
+
+    elif action == "watch_speed":
+        ctx.user_data["action"] = None
+        chat_id = update.effective_chat.id
+        try:
+            spd = int(text.strip())
+            spd = max(5, min(300, spd))
+        except:
+            await update.message.reply_text("❌ Введи число від 5 до 300!", parse_mode="HTML")
+            return
+        if chat_id not in watch_sessions:
+            watch_sessions[chat_id] = {"interval": spd, "auto_login": True, "url": f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/"}
+        else:
+            watch_sessions[chat_id]["interval"] = spd
+        await update.message.reply_text(f"⚡ <b>Швидкість: {spd} сек</b>", parse_mode="HTML")
+        await show_watch_panel(update, update.message)
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1397,54 +1572,114 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if fn:
         await fn(update, ctx)
 
-async def _watch_loop(chat_id: int, url: str):
-    """Робить скріншоти кожні 30 сек і кидає в чат."""
-    interval = 30
+async def _get_watch_browser_ctx(p, sess: dict):
+    """Запускає браузер і логіниться (авто або ручний режим)."""
+    from playwright.async_api import async_playwright
+    browser = await p.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+              "--disable-blink-features=AutomationControlled"]
+    )
+    bctx = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        viewport={"width": 1280, "height": 720},
+        locale="en-US",
+    )
+    await bctx.add_init_script(
+        "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+    )
+    # Якщо є куки — підставляємо
+    if login_cookies:
+        for name, val in login_cookies.items():
+            await bctx.add_cookies([{"name": name, "value": val, "domain": "aternos.org", "path": "/"}])
+    return browser, bctx
+
+
+async def _watch_do_login(page, bctx, sess: dict) -> bool:
+    """Логін через Playwright. Повертає True якщо успіх."""
+    auto = sess.get("auto_login", True)
+    w_user = sess.get("w_user") or ATERNOS_USER
+    w_pass = sess.get("w_pass") or ATERNOS_PASS
+    if not w_user or not w_pass:
+        return False
+    try:
+        await page.goto("https://aternos.org/go/", wait_until="domcontentloaded", timeout=30000)
+        # Чекаємо форму (до 20 сек)
+        for _ in range(20):
+            await asyncio.sleep(1)
+            if await page.query_selector("input[name='user']"):
+                break
+        user_inp = await page.query_selector("input[name='user']")
+        pass_inp = await page.query_selector("input[name='password']")
+        if not user_inp or not pass_inp:
+            return False
+        await user_inp.click()
+        for ch in w_user:
+            await page.type("input[name='user']", ch, delay=random.randint(40, 90))
+        await asyncio.sleep(0.2)
+        await pass_inp.click()
+        for ch in w_pass:
+            await page.type("input[name='password']", ch, delay=random.randint(40, 90))
+        await asyncio.sleep(0.3)
+        for sel in ["button[type='submit']", "button:has-text('Login')", ".login-button"]:
+            btn = await page.query_selector(sel)
+            if btn:
+                await btn.click()
+                break
+        await asyncio.sleep(4)
+        # Зберігаємо нові куки
+        new_cookies = await bctx.cookies()
+        for c in new_cookies:
+            login_cookies[c["name"]] = c["value"]
+        return True
+    except Exception as e:
+        log.error(f"watch_login: {e}")
+        return False
+
+
+async def _take_and_send_screenshot(chat_id: int, send_to: int, label: str = ""):
+    """Одиночний скріншот і надсилає в чат."""
+    sess = watch_sessions.get(chat_id, {})
+    url = sess.get("url", f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/")
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser, bctx = await _get_watch_browser_ctx(p, sess)
+            page = await bctx.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)
+            title = await page.title()
+            # Якщо бачимо форму логіну — логінимося
+            if await page.query_selector("input[name='user']"):
+                log.info("watch: бачу форму логіну, логінюсь...")
+                await _watch_do_login(page, bctx, sess)
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2)
+                title = await page.title()
+            screenshot = await page.screenshot(full_page=False)
+            await browser.close()
+        caption = (
+            f"👁 <b>Watch{' · ' + label if label else ''}</b>\n"
+            f"📄 {title}\n"
+            f"🔗 <code>{url}</code>\n"
+            f"⏰ {now_full()}"
+        )
+        await telegram_app.bot.send_photo(send_to, screenshot, caption=caption, parse_mode="HTML")
+    except Exception as e:
+        await telegram_app.bot.send_message(send_to, f"📸 ❌ <code>{str(e)[:200]}</code>", parse_mode="HTML")
+
+
+async def _watch_loop(chat_id: int):
+    """Основний цикл Watch — скріншоти з заданим інтервалом."""
     count = 0
     try:
         while True:
+            sess = watch_sessions.get(chat_id)
+            if not sess:
+                break
+            interval = sess.get("interval", 20)
             count += 1
-            try:
-                from playwright.async_api import async_playwright
-                async with async_playwright() as p:
-                    browser = await p.chromium.launch(
-                        headless=True,
-                        args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
-                    )
-                    bctx = await browser.new_context(
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        viewport={"width": 1280, "height": 720},
-                    )
-                    for name, val in login_cookies.items():
-                        await bctx.add_cookies([{
-                            "name": name, "value": val,
-                            "domain": "aternos.org", "path": "/"
-                        }])
-                    page = await bctx.new_page()
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    await asyncio.sleep(2)
-                    title = await page.title()
-                    screenshot = await page.screenshot(full_page=False)
-                    await browser.close()
-
-                caption = (
-                    f"👁 <b>Watch #{count}</b>\n"
-                    f"🔗 {url}\n"
-                    f"📄 {title}\n"
-                    f"⏰ {now_full()}"
-                )
-                await telegram_app.bot.send_photo(
-                    chat_id, screenshot,
-                    caption=caption, parse_mode="HTML"
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                await telegram_app.bot.send_message(
-                    chat_id,
-                    f"👁 Watch #{count} ❌\n<code>{str(e)[:200]}</code>",
-                    parse_mode="HTML"
-                )
+            await _take_and_send_screenshot(chat_id, chat_id, label=f"#{count}")
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         await telegram_app.bot.send_message(
@@ -1454,14 +1689,42 @@ async def _watch_loop(chat_id: int, url: str):
         )
 
 
+async def show_watch_panel(update: Update, msg):
+    """Показує Watch-панель."""
+    chat_id = msg.chat_id if hasattr(msg, "chat_id") else update.effective_chat.id
+    if chat_id not in watch_sessions:
+        watch_sessions[chat_id] = {
+            "interval": 20,
+            "auto_login": True,
+            "url": f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/",
+        }
+    sess = watch_sessions[chat_id]
+    running = sess.get("task") and not sess["task"].done()
+    auto = sess.get("auto_login", True)
+    w_user = sess.get("w_user", "—")
+    w_pass = "✅ є" if sess.get("w_pass") else "❌ немає"
+    await msg.reply_text(
+        f"👁 <b>WATCH ПАНЕЛЬ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{'🟢 Активний' if running else '🔴 Зупинено'}\n"
+        f"⚡ Інтервал: <b>{sess.get('interval', 20)} сек</b>\n"
+        f"🔑 Режим: <b>{'🤖 Авто (env)' if auto else '✋ Вручну'}</b>\n"
+        f"👤 Логін: <b>{w_user if not auto else '(з env)'}</b>\n"
+        f"🔐 Пароль: <b>{w_pass if not auto else '(з env)'}</b>\n"
+        f"🔗 URL: <code>{sess.get('url', '—')}</code>\n"
+        f"🍪 Куків: <b>{len(login_cookies)}</b>",
+        reply_markup=watch_kb(chat_id),
+        parse_mode="HTML",
+    )
+
+
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Команда /watch — запускає або зупиняє моніторинг екрану."""
+    """Команда /watch."""
     if not reg(update):
         return
     if not is_admin(update):
         await get_msg(update).reply_text("🚫 <b>Тільки адміни!</b>", parse_mode="HTML")
         return
-
     chat_id = update.effective_chat.id
     args = ctx.args  # /watch stop | /watch <url> | /watch
 
@@ -1471,45 +1734,14 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             task = watch_sessions[chat_id].get("task")
             if task and not task.done():
                 task.cancel()
-            del watch_sessions[chat_id]
+            if chat_id in watch_sessions:
+                watch_sessions[chat_id]["task"] = None
             await get_msg(update).reply_text("🛑 <b>Watch зупинено!</b>", parse_mode="HTML")
         else:
             await get_msg(update).reply_text("ℹ️ Watch не запущено.", parse_mode="HTML")
         return
 
-    # Якщо вже запущено — показуємо статус
-    if chat_id in watch_sessions:
-        sess = watch_sessions[chat_id]
-        task = sess.get("task")
-        alive = task and not task.done()
-        await get_msg(update).reply_text(
-            f"👁 <b>Watch вже запущено!</b>\n\n"
-            f"🔗 URL: <code>{sess['url']}</code>\n"
-            f"⚡ Статус: {'🟢 Активний' if alive else '🔴 Завис'}\n\n"
-            f"/watch stop — зупинити\n"
-            f"/watch <url> — перезапустити з новим URL",
-            parse_mode="HTML"
-        )
-        return
-
-    # Визначаємо URL
-    if args:
-        url = args[0]
-    elif SERVER_ID:
-        url = f"https://aternos.org/server/{SERVER_ID}"
-    else:
-        url = "https://aternos.org/go/"
-
-    sm = await get_msg(update).reply_text(
-        f"👁 <b>Watch запускається...</b>\n\n"
-        f"🔗 <code>{url}</code>\n"
-        f"📸 Скріншоти кожні 30 сек\n\n"
-        f"Зупинити: /watch stop",
-        parse_mode="HTML"
-    )
-    task = asyncio.create_task(_watch_loop(chat_id, url))
-    watch_sessions[chat_id] = {"url": url, "task": task}
-    await send_log(f"👁 <b>WATCH запущено</b>\n👤 {ulabel(update)}\n🔗 {url}")
+    await show_watch_panel(update, get_msg(update))
 
 
 async def _background_login():
@@ -1586,6 +1818,7 @@ async def main():
         telegram_app.add_handler(CommandHandler(cmd, fn))
 
     telegram_app.add_handler(CallbackQueryHandler(on_admin_button, pattern="^adm_"))
+    telegram_app.add_handler(CallbackQueryHandler(on_admin_button, pattern="^watch_"))
     telegram_app.add_handler(CallbackQueryHandler(on_button))
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
