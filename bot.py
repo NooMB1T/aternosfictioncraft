@@ -321,17 +321,55 @@ async def aternos_login() -> bool:
                 return False
 
             log.info("   Вводу логин/пароль...")
-            await page.fill("input[name='user']", ATERNOS_USER)
-            await asyncio.sleep(0.3)
-            await page.fill("input[name='password']", ATERNOS_PASS)
+            
+            # Вводимо повільно як людина
+            user_input = await page.query_selector("input[name='user']")
+            if user_input:
+                await user_input.click()
+                await asyncio.sleep(0.2)
+                for char in ATERNOS_USER:
+                    await page.type("input[name='user']", char, delay=random.randint(50, 100))
+                log.info("   ✅ Логин введен")
+            else:
+                log.error("   ❌ Поле логина не найдено!")
+                await browser.close()
+                return False
+
             await asyncio.sleep(0.3)
 
-            for sel in ["button[type='submit']", "button:has-text('Login')"]:
+            pass_input = await page.query_selector("input[name='password']")
+            if pass_input:
+                await pass_input.click()
+                await asyncio.sleep(0.2)
+                for char in ATERNOS_PASS:
+                    await page.type("input[name='password']", char, delay=random.randint(50, 100))
+                log.info("   ✅ Пароль введен")
+            else:
+                log.error("   ❌ Поле пароля не найдено!")
+                await browser.close()
+                return False
+
+            await asyncio.sleep(0.5)
+
+            # Натискаємо кнопку логіну
+            login_btn = None
+            for sel in ["button[type='submit']", "button:has-text('Login')", "button:has-text('Log in')", ".login-button", "input[type='submit']"]:
                 try:
-                    await page.click(sel)
-                    break
+                    el = await page.query_selector(sel)
+                    if el:
+                        login_btn = el
+                        log.info(f"   ✅ Кнопка найдена: {sel}")
+                        break
                 except:
                     pass
+
+            if login_btn:
+                await login_btn.click()
+                log.info("   ✅ Кнопка натиснута")
+            else:
+                log.error("   ❌ Кнопка логіну не найдена!")
+                await browser.close()
+                return False
 
             await asyncio.sleep(5)
             cookies = await ctx.cookies()
