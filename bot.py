@@ -41,6 +41,9 @@ telegram_app=None; http_session=None; aternos_connected=False; last_login_time=0
 server_status="offline"; current_players=[]; login_cookies={}
 
 WAIT_CODE=1; WAIT_BROADCAST=2; WAIT_ANNOUNCE=3; WAIT_MOTD=4; WAIT_SEED=5; WAIT_SHOP=6; WAIT_NOTE=7; WAIT_WARN=8
+WAIT_COOKIE=9; WAIT_WATCH_URL=10
+
+watch_sessions: dict = {}   # chat_id -> {"url": str, "interval": int, "task": Task}
 
 # ══════════════════════════════════════════════════════════════════
 # ЛОКАЛІЗАЦІЯ (РУ)
@@ -524,11 +527,15 @@ def admin_kb():
         [InlineKeyboardButton("━━━ 📢 СООБЩЕНИЯ ━━━", callback_data="noop")],
         [InlineKeyboardButton("📢 Броадкаст", callback_data="adm_broadcast"),
          InlineKeyboardButton("📣 Анонс", callback_data="adm_announce")],
-        [InlineKeyboardButton("━━━ ⚙️ ATERNOS ━━━", callback_data="noop")],
+        [InlineKeyboardButton("━━━ ⚙️ ATERNOS / ЛОГІН ━━━", callback_data="noop")],
         [InlineKeyboardButton("🔄 Переподключить", callback_data="adm_reconnect"),
          InlineKeyboardButton("📊 Статус", callback_data="adm_aternos_status")],
+        [InlineKeyboardButton("🍪 Ввести куки", callback_data="adm_set_cookie"),
+         InlineKeyboardButton("🔍 Диагностика", callback_data="adm_diagnose")],
         [InlineKeyboardButton("📸 Скриншот", callback_data="adm_screenshot"),
-         InlineKeyboardButton("📋 Консоль", callback_data="adm_console")],
+         InlineKeyboardButton("👁 Watch", callback_data="adm_watch")],
+        [InlineKeyboardButton("📋 Консоль", callback_data="adm_console"),
+         InlineKeyboardButton("🛑 Стоп Watch", callback_data="adm_watch_stop")],
         [InlineKeyboardButton("━━━ 👥 ИГРОКИ ━━━", callback_data="noop")],
         [InlineKeyboardButton("👥 Список", callback_data="adm_users"),
          InlineKeyboardButton("⚠️ Варны", callback_data="adm_warns")],
@@ -1011,6 +1018,76 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await q.message.edit_text(f"❌ Консоль недоступна (код {code})", reply_markup=admin_kb(), parse_mode="HTML")
 
+    elif d == "adm_set_cookie":
+        ctx.user_data["action"] = "set_cookie"
+        await q.message.reply_text(
+            "🍪 <b>РУЧНЕ ВВЕДЕННЯ КУКІВ</b>\n\n"
+            "Введи куки у форматі JSON або як рядок:\n\n"
+            "<b>JSON:</b>\n<code>{\"ATERNOS_SESSION\": \"xxx\", \"ATERNOS_SEC\": \"yyy\"}</code>\n\n"
+            "<b>або рядком:</b>\n<code>ATERNOS_SESSION=xxx; ATERNOS_SEC=yyy</code>\n\n"
+            "Де взяти куки:\n"
+            "DevTools → Application → Cookies → aternos.org\n\n"
+            "<i>/cancel — скасувати</i>",
+            parse_mode="HTML"
+        )
+
+    elif d == "adm_diagnose":
+        await q.message.edit_text("🔍 <b>Діагностика...</b>", parse_mode="HTML")
+        lines = []
+        lines.append(f"🔌 Aternos connected: <b>{'✅' if aternos_connected else '❌'}</b>")
+        lines.append(f"📡 http_session: <b>{'✅ є' if http_session and not http_session.closed else '❌ немає/закрита'}</b>")
+        lines.append(f"🍪 Куків у пам'яті: <b>{len(login_cookies)}</b>")
+        if login_cookies:
+            important = ["ATERNOS_SESSION", "ATERNOS_SEC", "PHPSESSID"]
+            for k in important:
+                val = login_cookies.get(k)
+                lines.append(f"  {'✅' if val else '❌'} {k}: {'є (' + str(len(val)) + ' символів)' if val else 'відсутній'}")
+        lines.append(f"⏱ Останній логін: <b>{datetime.fromtimestamp(last_login_time).strftime('%H:%M:%S') if last_login_time else 'ніколи'}</b>")
+        # Тест запиту
+        if http_session and not http_session.closed:
+            try:
+                async with http_session.get(
+                    "https://aternos.org/panel/ajax/status.php",
+                    params={"server": SERVER_ID},
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as r:
+                    lines.append(f"🌐 Тест status.php: <b>{r.status}</b>")
+                    if r.status == 403:
+                        lines.append("  ⚠️ 403 = сесія протухла або куки не пройшли")
+                    elif r.status == 200:
+                        lines.append("  ✅ Запит успішний!")
+            except Exception as e:
+                lines.append(f"🌐 Тест: ❌ <code>{str(e)[:100]}</code>")
+        else:
+            lines.append("🌐 Тест: ❌ Сесія не ініціалізована")
+        await q.message.edit_text(
+            "🔍 <b>ДІАГНОСТИКА</b>\n\n" + "\n".join(lines),
+            reply_markup=admin_kb(), parse_mode="HTML"
+        )
+
+    elif d == "adm_watch":
+        ctx.user_data["action"] = "watch_url"
+        await q.message.reply_text(
+            "👁 <b>WATCH — моніторинг екрану</b>\n\n"
+            "Введи URL для стеження (або натисни скасувати для стандартного):\n\n"
+            "• <code>https://aternos.org/server/</code> — панель сервера\n"
+            "• <code>https://aternos.org/go/</code> — сторінка логіну\n"
+            "• <code>default</code> — автоматично\n\n"
+            "<i>/cancel — скасувати</i>",
+            parse_mode="HTML"
+        )
+
+    elif d == "adm_watch_stop":
+        chat_id = q.message.chat_id
+        if chat_id in watch_sessions:
+            task = watch_sessions[chat_id].get("task")
+            if task and not task.done():
+                task.cancel()
+            del watch_sessions[chat_id]
+            await q.message.edit_text("🛑 <b>Watch зупинено!</b>", reply_markup=admin_kb(), parse_mode="HTML")
+        else:
+            await q.message.edit_text("ℹ️ Watch не запущено", reply_markup=admin_kb(), parse_mode="HTML")
+
     elif d == "adm_broadcast":
         ctx.user_data["action"] = "broadcast"
         await q.message.reply_text("📢 <b>Напиши сообщение для всех:</b>\n<i>/cancel — отмена</i>", parse_mode="HTML")
@@ -1228,6 +1305,76 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🚫 <b>ЗАБАНЕН!</b>\n👤 @{target}", parse_mode="HTML")
         await send_log(f"🚫 <b>БАН</b>\n👤 @{target}\n👮 {ulabel(update)}")
 
+    elif action == "set_cookie":
+        ctx.user_data["action"] = None
+        global http_session, aternos_connected, login_cookies
+        new_cookies = {}
+        text_stripped = text.strip()
+        # Парсимо JSON
+        if text_stripped.startswith("{"):
+            try:
+                new_cookies = json.loads(text_stripped)
+            except Exception as e:
+                await update.message.reply_text(f"❌ Помилка JSON: <code>{e}</code>", parse_mode="HTML")
+                return
+        else:
+            # Парсимо рядок типу "NAME=value; NAME2=value2"
+            for part in text_stripped.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    new_cookies[k.strip()] = v.strip()
+        if not new_cookies:
+            await update.message.reply_text("❌ Не вдалося розпарсити куки!", parse_mode="HTML")
+            return
+        # Оновлюємо сесію
+        login_cookies.update(new_cookies)
+        jar = aiohttp.CookieJar()
+        for name, val in login_cookies.items():
+            from yarl import URL as yarl_URL
+            jar.update_cookies({name: val}, response_url=yarl_URL("https://aternos.org/"))
+        if http_session and not http_session.closed:
+            await http_session.close()
+        http_session = aiohttp.ClientSession(
+            cookie_jar=jar,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+        aternos_connected = True
+        important = ["ATERNOS_SESSION", "ATERNOS_SEC", "PHPSESSID"]
+        found = [k for k in important if k in login_cookies]
+        await update.message.reply_text(
+            f"✅ <b>Куки встановлені!</b>\n\n"
+            f"🍪 Всього: <b>{len(login_cookies)}</b>\n"
+            f"✅ Важливі: <b>{', '.join(found) if found else 'не знайдено!'}</b>\n\n"
+            f"<i>Тепер спробуй 🔍 Діагностика</i>",
+            parse_mode="HTML"
+        )
+        await send_log(f"🍪 <b>КУКИ ОНОВЛЕНІ</b>\n👤 {ulabel(update)}\n🍪 {len(login_cookies)} шт.")
+
+    elif action == "watch_url":
+        ctx.user_data["action"] = None
+        chat_id = update.effective_chat.id
+        if text.strip().lower() == "default" or text.strip() == "":
+            url = f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/"
+        else:
+            url = text.strip()
+        # Зупиняємо попередній watch якщо є
+        if chat_id in watch_sessions:
+            old_task = watch_sessions[chat_id].get("task")
+            if old_task and not old_task.done():
+                old_task.cancel()
+        sm = await update.message.reply_text(
+            f"👁 <b>Watch запускається...</b>\n🔗 <code>{url}</code>\n\n"
+            f"Скріншоти кожні 30 секунд.\n<i>Зупинити: /admin → 🛑 Стоп Watch</i>",
+            parse_mode="HTML"
+        )
+        task = asyncio.create_task(_watch_loop(chat_id, url))
+        watch_sessions[chat_id] = {"url": url, "task": task}
+        await send_log(f"👁 <b>WATCH</b>\n👤 {ulabel(update)}\n🔗 {url}")
+
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1249,6 +1396,121 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fn = fns.get(q.data)
     if fn:
         await fn(update, ctx)
+
+async def _watch_loop(chat_id: int, url: str):
+    """Робить скріншоти кожні 30 сек і кидає в чат."""
+    interval = 30
+    count = 0
+    try:
+        while True:
+            count += 1
+            try:
+                from playwright.async_api import async_playwright
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
+                    )
+                    bctx = await browser.new_context(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        viewport={"width": 1280, "height": 720},
+                    )
+                    for name, val in login_cookies.items():
+                        await bctx.add_cookies([{
+                            "name": name, "value": val,
+                            "domain": "aternos.org", "path": "/"
+                        }])
+                    page = await bctx.new_page()
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(2)
+                    title = await page.title()
+                    screenshot = await page.screenshot(full_page=False)
+                    await browser.close()
+
+                caption = (
+                    f"👁 <b>Watch #{count}</b>\n"
+                    f"🔗 {url}\n"
+                    f"📄 {title}\n"
+                    f"⏰ {now_full()}"
+                )
+                await telegram_app.bot.send_photo(
+                    chat_id, screenshot,
+                    caption=caption, parse_mode="HTML"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                await telegram_app.bot.send_message(
+                    chat_id,
+                    f"👁 Watch #{count} ❌\n<code>{str(e)[:200]}</code>",
+                    parse_mode="HTML"
+                )
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        await telegram_app.bot.send_message(
+            chat_id,
+            f"🛑 <b>Watch зупинено.</b> Зроблено {count} скріншотів.",
+            parse_mode="HTML"
+        )
+
+
+async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда /watch — запускає або зупиняє моніторинг екрану."""
+    if not reg(update):
+        return
+    if not is_admin(update):
+        await get_msg(update).reply_text("🚫 <b>Тільки адміни!</b>", parse_mode="HTML")
+        return
+
+    chat_id = update.effective_chat.id
+    args = ctx.args  # /watch stop | /watch <url> | /watch
+
+    # /watch stop
+    if args and args[0].lower() == "stop":
+        if chat_id in watch_sessions:
+            task = watch_sessions[chat_id].get("task")
+            if task and not task.done():
+                task.cancel()
+            del watch_sessions[chat_id]
+            await get_msg(update).reply_text("🛑 <b>Watch зупинено!</b>", parse_mode="HTML")
+        else:
+            await get_msg(update).reply_text("ℹ️ Watch не запущено.", parse_mode="HTML")
+        return
+
+    # Якщо вже запущено — показуємо статус
+    if chat_id in watch_sessions:
+        sess = watch_sessions[chat_id]
+        task = sess.get("task")
+        alive = task and not task.done()
+        await get_msg(update).reply_text(
+            f"👁 <b>Watch вже запущено!</b>\n\n"
+            f"🔗 URL: <code>{sess['url']}</code>\n"
+            f"⚡ Статус: {'🟢 Активний' if alive else '🔴 Завис'}\n\n"
+            f"/watch stop — зупинити\n"
+            f"/watch <url> — перезапустити з новим URL",
+            parse_mode="HTML"
+        )
+        return
+
+    # Визначаємо URL
+    if args:
+        url = args[0]
+    elif SERVER_ID:
+        url = f"https://aternos.org/server/{SERVER_ID}"
+    else:
+        url = "https://aternos.org/go/"
+
+    sm = await get_msg(update).reply_text(
+        f"👁 <b>Watch запускається...</b>\n\n"
+        f"🔗 <code>{url}</code>\n"
+        f"📸 Скріншоти кожні 30 сек\n\n"
+        f"Зупинити: /watch stop",
+        parse_mode="HTML"
+    )
+    task = asyncio.create_task(_watch_loop(chat_id, url))
+    watch_sessions[chat_id] = {"url": url, "task": task}
+    await send_log(f"👁 <b>WATCH запущено</b>\n👤 {ulabel(update)}\n🔗 {url}")
+
 
 async def _background_login():
     await asyncio.sleep(3)
@@ -1319,6 +1581,7 @@ async def main():
         ("shop", cmd_shop),
         ("top", cmd_top),
         ("motd", cmd_motd),
+        ("watch", cmd_watch),
     ]:
         telegram_app.add_handler(CommandHandler(cmd, fn))
 
