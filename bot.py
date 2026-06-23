@@ -1452,6 +1452,146 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await q.answer("❌ Браузер не запущен!", show_alert=True)
 
+    # ── НОВЫЕ ФИЧИ ───────────────────────────────────────────────
+
+    elif d == "bc_page_info":
+        # Фича 1: Инфо о странице — размер, время загрузки, кол-во элементов
+        chat_id = q.message.chat_id
+        page = await bc_get_page(chat_id)
+        if not page:
+            await q.answer("❌ Браузер не запущен!", show_alert=True); return
+        try:
+            info = await page.evaluate("""() => ({
+                title:    document.title,
+                url:      location.href,
+                elements: document.querySelectorAll('*').length,
+                images:   document.images.length,
+                links:    document.links.length,
+                forms:    document.forms.length,
+                inputs:   document.querySelectorAll('input,textarea,select').length,
+                size:     document.documentElement.innerHTML.length,
+                width:    window.innerWidth,
+                height:   window.innerHeight,
+            })""")
+            await q.message.reply_text(
+                f"📊 <b>Инфо страницы</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📄 <b>{info['title'][:50]}</b>\n"
+                f"🔗 <code>{info['url'][:60]}</code>\n\n"
+                f"🔢 Элементов: <b>{info['elements']}</b>\n"
+                f"🖼 Картинок: <b>{info['images']}</b>\n"
+                f"🔗 Ссылок: <b>{info['links']}</b>\n"
+                f"📝 Форм: <b>{info['forms']}</b>\n"
+                f"⌨️ Полей ввода: <b>{info['inputs']}</b>\n"
+                f"📦 Размер HTML: <b>{info['size']//1024} КБ</b>\n"
+                f"📐 Вьюпорт: <b>{info['width']}×{info['height']}</b>",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            await q.message.reply_text(f"❌ <code>{e}</code>", parse_mode="HTML")
+
+    elif d == "bc_mobile_toggle":
+        # Фича 2: Переключение мобильный/десктоп режим
+        chat_id = q.message.chat_id
+        sess = browser_sessions.get(chat_id)
+        if not sess or not sess.get("active"):
+            await q.answer("❌ Браузер не запущен!", show_alert=True); return
+        mobile = not sess.get("mobile", False)
+        browser_sessions[chat_id]["mobile"] = mobile
+        # Меняем viewport через JS
+        if mobile:
+            vp = {"width": 390, "height": 844}
+            ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        else:
+            vp = {"width": 1280, "height": 720}
+            ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        try:
+            page = sess["page"]
+            await page.set_viewport_size(vp)
+            await page.evaluate(f"Object.defineProperty(navigator,'userAgent',{{get:()=>'{ua}'}})")
+            await page.reload(wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(1)
+            mode_txt = "📱 Мобильный (390×844)" if mobile else "🖥 Десктоп (1280×720)"
+            await q.message.edit_text(f"✅ <b>Режим: {mode_txt}</b>", reply_markup=browser_control_kb(chat_id), parse_mode="HTML")
+            await bc_screenshot_and_send(chat_id, f"{'📱' if mobile else '🖥'} {mode_txt}")
+        except Exception as e:
+            await q.message.reply_text(f"❌ <code>{e}</code>", parse_mode="HTML")
+
+    elif d == "bc_dark_mode":
+        # Фича 3: Dark mode — инжектируем CSS
+        chat_id = q.message.chat_id
+        page = await bc_get_page(chat_id)
+        if not page:
+            await q.answer("❌ Браузер не запущен!", show_alert=True); return
+        try:
+            await page.evaluate("""() => {
+                const id = 'tg-dark-style';
+                const existing = document.getElementById(id);
+                if (existing) { existing.remove(); return false; }
+                const style = document.createElement('style');
+                style.id = id;
+                style.textContent = `
+                    * { background-color: #1a1a2e !important;
+                        color: #e0e0e0 !important;
+                        border-color: #444 !important; }
+                    img, video { opacity: 0.85 !important; }
+                    a { color: #7eb8f7 !important; }
+                `;
+                document.head.appendChild(style);
+                return true;
+            }""")
+            await asyncio.sleep(0.3)
+            await bc_screenshot_and_send(chat_id, "🌙 Dark mode")
+            await q.message.edit_text("🌙 <b>Dark mode переключён!</b>", reply_markup=browser_control_kb(chat_id), parse_mode="HTML")
+        except Exception as e:
+            await q.message.reply_text(f"❌ <code>{e}</code>", parse_mode="HTML")
+
+    elif d == "bc_click_text":
+        # Фича 4: Клик по тексту — ищет элемент с таким текстом
+        ctx.user_data["action"] = "bc_click_by_text"
+        await q.message.reply_text(
+            "🎯 <b>Клик по тексту</b>\n\n"
+            "Введи текст кнопки/ссылки для клика:\n"
+            "Пример: <code>Login</code> или <code>Start</code>\n\n"
+            "<i>/cancel — отмена</i>", parse_mode="HTML")
+
+    elif d == "bc_autosnap":
+        # Фича 5: Авто-снап — периодические скриншоты
+        chat_id = q.message.chat_id
+        sess = browser_sessions.get(chat_id, {})
+        task = sess.get("auto_snap_task")
+        if task and not task.done():
+            task.cancel()
+            browser_sessions[chat_id]["auto_snap_task"] = None
+            await q.message.edit_text("⏱ <b>Авто-снап выключен.</b>", reply_markup=browser_control_kb(chat_id), parse_mode="HTML")
+        else:
+            if not sess.get("active"):
+                await q.answer("❌ Браузер не запущен!", show_alert=True); return
+            ctx.user_data["action"] = "bc_autosnap_interval"
+            await q.message.reply_text(
+                "⏱ <b>Авто-снап</b>\n\nВведи интервал в секундах (10–300):\n"
+                "Пример: <code>30</code>\n\n<i>/cancel — отмена</i>", parse_mode="HTML")
+
+    elif d == "bc_snap_full":
+        # Полный скриншот страницы
+        chat_id = q.message.chat_id
+        page = await bc_get_page(chat_id)
+        if not page:
+            await q.answer("❌ Браузер не запущен!", show_alert=True); return
+        try:
+            import io
+            title = await page.title()
+            shot  = await page.screenshot(full_page=True)
+            bio   = io.BytesIO(shot); bio.name = "full.png"
+            await telegram_app.bot.send_photo(
+                chat_id, bio,
+                caption=f"🖼 Полный скрин\n📄 {title[:50]}\n⏰ {now_str()}",
+                parse_mode="HTML"
+            )
+            await q.message.edit_text("🖼 <b>Полный скриншот отправлен!</b>", reply_markup=browser_control_kb(chat_id), parse_mode="HTML")
+        except Exception as e:
+            await q.message.reply_text(f"❌ <code>{e}</code>", parse_mode="HTML")
+
     # ── ИИ ───────────────────────────────────────────────────────
     elif d == "bc_ai_login":
         chat_id = q.message.chat_id
@@ -1827,10 +1967,47 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ Формат: <code>x,y</code>\nПомилка: {e}", parse_mode="HTML")
 
-    elif action == "bc_ai":
+    elif action == "bc_click_by_text":
         ctx.user_data["action"] = None
         chat_id = update.effective_chat.id
-        asyncio.create_task(bc_do_ai_action(chat_id, text.strip()))
+        page = await bc_get_page(chat_id)
+        if not page:
+            await update.message.reply_text("❌ Браузер не запущен!", parse_mode="HTML"); return
+        query = text.strip()
+        try:
+            # Ищем элемент с таким текстом и кликаем
+            clicked = await page.evaluate(f"""(txt) => {{
+                const els = [...document.querySelectorAll('button,a,input[type=submit],[role=button]')];
+                const el = els.find(e => e.innerText.trim().toLowerCase().includes(txt.toLowerCase())
+                                      || e.value?.toLowerCase().includes(txt.toLowerCase()));
+                if (el) {{ el.scrollIntoView({{block:'center'}}); el.click(); return el.tagName+': '+el.innerText.trim().slice(0,30); }}
+                return null;
+            }}""", query)
+            if clicked:
+                await asyncio.sleep(0.8)
+                await bc_screenshot_and_send(chat_id, f"🎯 Клик: «{query}» → {clicked}")
+            else:
+                await update.message.reply_text(f"🎯 Элемент «{query}» <b>не найден</b>", parse_mode="HTML")
+        except Exception as e:
+            await update.message.reply_text(f"❌ <code>{e}</code>", parse_mode="HTML")
+
+    elif action == "bc_autosnap_interval":
+        ctx.user_data["action"] = None
+        chat_id = update.effective_chat.id
+        try:
+            interval = max(10, min(300, int(text.strip())))
+        except:
+            await update.message.reply_text("❌ Введи число от 10 до 300", parse_mode="HTML"); return
+        if chat_id not in browser_sessions:
+            await update.message.reply_text("❌ Браузер не запущен!", parse_mode="HTML"); return
+        browser_sessions[chat_id]["auto_snap_interval"] = interval
+        task = asyncio.create_task(_bc_autosnap_loop(chat_id, interval))
+        browser_sessions[chat_id]["auto_snap_task"] = task
+        await update.message.reply_text(
+            f"⏱ <b>Авто-снап запущен!</b>\n📸 Каждые {interval} сек\n"
+            f"Остановить: /browser → кнопка ⏱",
+            parse_mode="HTML"
+        )
 
     elif action in ("bc_rclick", "bc_dblclick", "bc_hover"):
         ctx.user_data["action"] = None
@@ -1931,6 +2108,25 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"🔎 «{query}» — <b>не найдено</b>", parse_mode="HTML")
         except Exception as e:
             await update.message.reply_text(f"❌ <code>{e}</code>", parse_mode="HTML")
+
+
+async def _bc_autosnap_loop(chat_id: int, interval: int):
+    """Авто-снап: скриншот каждые N секунд."""
+    count = 0
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            page = await bc_get_page(chat_id)
+            if not page:
+                break
+            count += 1
+            await bc_screenshot_and_send(chat_id, f"⏱ Авто-снап #{count} | каждые {interval}с\n⏰ {now_full()}")
+    except asyncio.CancelledError:
+        await telegram_app.bot.send_message(
+            chat_id,
+            f"⏱ <b>Авто-снап остановлен.</b> Сделано {count} скриншотов.",
+            parse_mode="HTML"
+        )
 
 
 async def handle_browser_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2149,138 +2345,204 @@ GEMINI_MODEL   = "gemini-2.0-flash"
 GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 def browser_control_kb(chat_id: int):
-    sess = browser_sessions.get(chat_id, {})
-    active = sess.get("active", False)
-    inp_on = chat_id in browser_control_mode
-    ai_src = "Gemini 🆓" if GEMINI_API_KEY else "—"
+    sess    = browser_sessions.get(chat_id, {})
+    active  = sess.get("active", False)
+    inp_on  = chat_id in browser_control_mode
+    mobile  = sess.get("mobile", False)
+    ai_src  = "Gemini 🆓" if GEMINI_API_KEY else "нет ключа"
+    auto_sn = sess.get("auto_snap_task") and not sess["auto_snap_task"].done() if sess.get("auto_snap_task") else False
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
             f"{'🟢 Браузер активен' if active else '🔴 Браузер не запущен'}",
             callback_data="noop")],
-        [InlineKeyboardButton("🚀 Запустить", callback_data="bc_start"),
-         InlineKeyboardButton("🔄 Перезапуск", callback_data="bc_restart"),
-         InlineKeyboardButton("🛑 Закрыть", callback_data="bc_close")],
+        [InlineKeyboardButton("🚀 Запустить",  callback_data="bc_start"),
+         InlineKeyboardButton("🔄 Рестарт",   callback_data="bc_restart"),
+         InlineKeyboardButton("🛑 Закрыть",   callback_data="bc_close")],
+        # ── КЛАВИШИ ──────────────────────────────────────────────
         [InlineKeyboardButton("━━━ ⌨️ КЛАВИШИ ━━━", callback_data="noop")],
         [InlineKeyboardButton("TAB",   callback_data="bc_key_Tab"),
          InlineKeyboardButton("ENTER", callback_data="bc_key_Enter"),
          InlineKeyboardButton("ESC",   callback_data="bc_key_Escape"),
-         InlineKeyboardButton("⌫ DEL", callback_data="bc_key_Backspace")],
-        [InlineKeyboardButton("▲",  callback_data="bc_key_ArrowUp"),
-         InlineKeyboardButton("▼",  callback_data="bc_key_ArrowDown"),
+         InlineKeyboardButton("⌫",     callback_data="bc_key_Backspace")],
+        [InlineKeyboardButton("▲", callback_data="bc_key_ArrowUp"),
+         InlineKeyboardButton("▼", callback_data="bc_key_ArrowDown"),
          InlineKeyboardButton("◀", callback_data="bc_key_ArrowLeft"),
          InlineKeyboardButton("▶", callback_data="bc_key_ArrowRight")],
-        [InlineKeyboardButton("F5 Обновить",  callback_data="bc_key_F5"),
-         InlineKeyboardButton("Ctrl+A",       callback_data="bc_key_ctrla"),
-         InlineKeyboardButton("Ctrl+C",       callback_data="bc_key_ctrlc"),
-         InlineKeyboardButton("Ctrl+V",       callback_data="bc_key_ctrlv")],
+        [InlineKeyboardButton("F5",     callback_data="bc_key_F5"),
+         InlineKeyboardButton("Ctrl+A", callback_data="bc_key_ctrla"),
+         InlineKeyboardButton("Ctrl+C", callback_data="bc_key_ctrlc"),
+         InlineKeyboardButton("Ctrl+V", callback_data="bc_key_ctrlv")],
+        # ── МЫШЬ ─────────────────────────────────────────────────
         [InlineKeyboardButton("━━━ 🖱 МЫШЬ ━━━", callback_data="noop")],
-        [InlineKeyboardButton("🖱 ЛКМ (x,y)",   callback_data="bc_click_xy"),
-         InlineKeyboardButton("🖱 ПКМ (x,y)",   callback_data="bc_rclick_xy"),
-         InlineKeyboardButton("🖱 2x клик",      callback_data="bc_dblclick_xy")],
-        [InlineKeyboardButton("🔍 Навести (x,y)", callback_data="bc_hover_xy"),
-         InlineKeyboardButton("↕ Drag (x1,y1→x2,y2)", callback_data="bc_drag_xy")],
-        [InlineKeyboardButton("📜 Скрол ↓",   callback_data="bc_scroll_down"),
-         InlineKeyboardButton("📜 Скрол ↑",   callback_data="bc_scroll_up"),
-         InlineKeyboardButton("↔ Скрол →",    callback_data="bc_scroll_right")],
+        [InlineKeyboardButton("🖱 ЛКМ",  callback_data="bc_click_xy"),
+         InlineKeyboardButton("🖱 ПКМ",  callback_data="bc_rclick_xy"),
+         InlineKeyboardButton("🖱 2×кл", callback_data="bc_dblclick_xy")],
+        [InlineKeyboardButton("🔍 Hover",     callback_data="bc_hover_xy"),
+         InlineKeyboardButton("↕ Drag",       callback_data="bc_drag_xy"),
+         InlineKeyboardButton("🎯 Кл.по тексту", callback_data="bc_click_text")],
+        [InlineKeyboardButton("📜 ↓",  callback_data="bc_scroll_down"),
+         InlineKeyboardButton("📜 ↑",  callback_data="bc_scroll_up"),
+         InlineKeyboardButton("📜 →",  callback_data="bc_scroll_right")],
+        # ── НАВИГАЦИЯ ─────────────────────────────────────────────
         [InlineKeyboardButton("━━━ 🗺 НАВИГАЦИЯ ━━━", callback_data="noop")],
-        [InlineKeyboardButton("🏠 Главная",  callback_data="bc_nav_home"),
-         InlineKeyboardButton("🔑 Логин",    callback_data="bc_nav_login"),
-         InlineKeyboardButton("🖥 Сервер",   callback_data="bc_nav_server")],
-        [InlineKeyboardButton("◀️ Назад",    callback_data="bc_nav_back"),
-         InlineKeyboardButton("🔄 Reload",   callback_data="bc_nav_reload"),
-         InlineKeyboardButton("✏️ URL",      callback_data="bc_nav_url")],
+        [InlineKeyboardButton("🏠 Главная", callback_data="bc_nav_home"),
+         InlineKeyboardButton("🔑 Логин",   callback_data="bc_nav_login"),
+         InlineKeyboardButton("🖥 Сервер",  callback_data="bc_nav_server")],
+        [InlineKeyboardButton("◀️ Назад",   callback_data="bc_nav_back"),
+         InlineKeyboardButton("🔄 Reload",  callback_data="bc_nav_reload"),
+         InlineKeyboardButton("✏️ URL",     callback_data="bc_nav_url")],
+        # ── ИНСТРУМЕНТЫ ───────────────────────────────────────────
         [InlineKeyboardButton("━━━ 🔧 ИНСТРУМЕНТЫ ━━━", callback_data="noop")],
-        [InlineKeyboardButton("🔎 Найти текст",      callback_data="bc_find_text"),
-         InlineKeyboardButton("📋 Копировать текст", callback_data="bc_copy_text")],
-        [InlineKeyboardButton("🖼 Полный скрин",     callback_data="bc_snap_full"),
-         InlineKeyboardButton("🔍+ Zoom +",          callback_data="bc_zoom_in"),
-         InlineKeyboardButton("🔍- Zoom -",          callback_data="bc_zoom_out")],
-        [InlineKeyboardButton("📝 Заполнить форму",  callback_data="bc_fill_form"),
-         InlineKeyboardButton("🧹 Очистить куки",    callback_data="bc_clear_cookies")],
+        [InlineKeyboardButton("🔎 Найти",       callback_data="bc_find_text"),
+         InlineKeyboardButton("📋 Копир.текст", callback_data="bc_copy_text"),
+         InlineKeyboardButton("📊 Инфо страниц", callback_data="bc_page_info")],
+        [InlineKeyboardButton("🖼 Полный скрин", callback_data="bc_snap_full"),
+         InlineKeyboardButton("🔍+",             callback_data="bc_zoom_in"),
+         InlineKeyboardButton("🔍-",             callback_data="bc_zoom_out"),
+         InlineKeyboardButton("📱" + (" ✅" if mobile else ""), callback_data="bc_mobile_toggle")],
+        [InlineKeyboardButton("📝 Заполнить форму", callback_data="bc_fill_form"),
+         InlineKeyboardButton("🧹 Куки",            callback_data="bc_clear_cookies"),
+         InlineKeyboardButton("🌙 Dark mode",        callback_data="bc_dark_mode")],
+        [InlineKeyboardButton(
+            f"⏱ Авто-снап: {'🟢 ' + str(sess.get('auto_snap_interval',30)) + 'с' if auto_sn else '🔴 выкл'}",
+            callback_data="bc_autosnap")],
+        # ── ВВОД ──────────────────────────────────────────────────
         [InlineKeyboardButton("━━━ ✍️ ВВОД ━━━", callback_data="noop")],
         [InlineKeyboardButton(
             "⌨️ Режим ввода: " + ("🟢 ВКЛ" if inp_on else "🔴 ВЫКЛ"),
             callback_data="bc_toggle_input")],
-        [InlineKeyboardButton("━━━ 🤖 ИИ (" + ai_src + ") ━━━", callback_data="noop")],
-        [InlineKeyboardButton("🤖 ИИ: залогиниться",  callback_data="bc_ai_login"),
-         InlineKeyboardButton("🤖 ИИ задача...",      callback_data="bc_ai_custom")],
-        [InlineKeyboardButton("📸 Скриншот",          callback_data="bc_snap"),
-         InlineKeyboardButton("🔙 /admin",            callback_data="watch_back_admin")],
+        # ── ИИ ────────────────────────────────────────────────────
+        [InlineKeyboardButton(f"━━━ 🤖 ИИ ({ai_src}) ━━━", callback_data="noop")],
+        [InlineKeyboardButton("🤖 Залогиниться",  callback_data="bc_ai_login"),
+         InlineKeyboardButton("🤖 Задача...",     callback_data="bc_ai_custom")],
+        # ── НИЗ ───────────────────────────────────────────────────
+        [InlineKeyboardButton("📸 Скриншот", callback_data="bc_snap"),
+         InlineKeyboardButton("🔙 /admin",   callback_data="watch_back_admin")],
     ])
 
 
 async def bc_get_page(chat_id: int):
-    """Повертає активну сторінку браузера або None."""
+    """Возвращает активную страницу или None. Проверяет что страница жива."""
     sess = browser_sessions.get(chat_id)
     if not sess or not sess.get("active"):
         return None
-    return sess.get("page")
+    page = sess.get("page")
+    if page is None:
+        return None
+    try:
+        # Проверяем что страница ещё жива
+        if page.is_closed():
+            browser_sessions[chat_id]["active"] = False
+            return None
+    except:
+        return None
+    return page
 
 
 async def bc_screenshot_and_send(chat_id: int, caption: str = ""):
-    """Робить скріншот активної сторінки і надсилає."""
+    """Делает скриншот и отправляет в чат. Использует BytesIO для совместимости с PTB v21."""
+    import io
     page = await bc_get_page(chat_id)
     if not page:
-        await telegram_app.bot.send_message(chat_id, "❌ Браузер не запущено. Натисни 🚀 Запустити", parse_mode="HTML")
+        await telegram_app.bot.send_message(
+            chat_id,
+            "❌ <b>Браузер не запущен.</b>\nНажми /browser → 🚀 Запустить",
+            parse_mode="HTML"
+        )
         return
     try:
-        title = await page.title()
-        url = page.url
-        shot = await page.screenshot(full_page=False)
-        cap = caption or f"📸 {title}\n🔗 <code>{url[:60]}</code>\n⏰ {now_str()}"
-        await telegram_app.bot.send_photo(chat_id, shot, caption=cap, parse_mode="HTML")
+        title  = await page.title()
+        url    = page.url
+        shot   = await page.screenshot(full_page=False)
+        # PTB v21 требует BytesIO, не raw bytes
+        bio        = io.BytesIO(shot)
+        bio.name   = "screenshot.png"
+        # Экранируем HTML-символы в URL
+        safe_url   = url[:80].replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        safe_title = title[:60].replace("<","&lt;").replace(">","&gt;")
+        cap = caption or f"📸 <b>{safe_title}</b>\n🔗 <code>{safe_url}</code>\n⏰ {now_str()}"
+        await telegram_app.bot.send_photo(chat_id, bio, caption=cap, parse_mode="HTML")
     except Exception as e:
-        await telegram_app.bot.send_message(chat_id, f"📸 ❌ <code>{str(e)[:150]}</code>", parse_mode="HTML")
+        log.error(f"bc_screenshot: {e}", exc_info=True)
+        await telegram_app.bot.send_message(
+            chat_id,
+            f"📸 ❌ Ошибка скриншота:\n<code>{str(e)[:200]}</code>",
+            parse_mode="HTML"
+        )
 
 
 async def bc_start_browser(chat_id: int):
-    """Запускає Playwright браузер і зберігає в browser_sessions."""
-    # Закриваємо старий якщо є
+    """Запускает Playwright браузер. Возвращает True или строку с ошибкой."""
     await bc_close_browser(chat_id)
     try:
         from playwright.async_api import async_playwright
-        pw = await async_playwright().start()
+        log.info(f"🌐 bc_start: запуск Playwright для chat={chat_id}")
+        pw      = await async_playwright().start()
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-                  "--disable-blink-features=AutomationControlled"]
+            args=[
+                "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-extensions",
+            ]
         )
-        ctx = await browser.new_context(
+        mobile = False
+        bctx = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 720},
             locale="en-US",
         )
-        await ctx.add_init_script(
+        await bctx.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
         )
-        # Підставляємо куки якщо є
+        # Подставляем куки если есть
         if login_cookies:
+            cookies_list = []
             for name, val in login_cookies.items():
-                await ctx.add_cookies([{"name": name, "value": val, "domain": "aternos.org", "path": "/"}])
-        page = await ctx.new_page()
+                cookies_list.append({"name": name, "value": val, "domain": "aternos.org", "path": "/"})
+            try:
+                await bctx.add_cookies(cookies_list)
+                log.info(f"🍪 bc_start: добавлено {len(cookies_list)} куков")
+            except Exception as e:
+                log.warning(f"bc_start cookies: {e}")
+
+        page      = await bctx.new_page()
         start_url = f"https://aternos.org/server/{SERVER_ID}" if SERVER_ID else "https://aternos.org/go/"
-        await page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+        log.info(f"🌐 bc_start: открываю {start_url}")
+        await page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
+        log.info(f"✅ bc_start: готово! title={await page.title()}")
+
         browser_sessions[chat_id] = {
-            "pw": pw, "browser": browser, "ctx": ctx,
+            "pw": pw, "browser": browser, "ctx": bctx,
             "page": page, "active": True, "url": start_url,
+            "mobile": False, "history": [start_url],
+            "auto_snap_task": None,
         }
         return True
     except Exception as e:
-        log.error(f"bc_start: {e}")
+        log.error(f"❌ bc_start_browser: {e}", exc_info=True)
         return str(e)
 
 
 async def bc_close_browser(chat_id: int):
-    """Закриває браузер і чистить сесію."""
+    """Закрывает браузер и чистит сессию."""
     sess = browser_sessions.pop(chat_id, None)
     browser_control_mode.discard(chat_id)
     if not sess:
         return
+    # Останавливаем авто-снап если запущен
+    task = sess.get("auto_snap_task")
+    if task and not task.done():
+        task.cancel()
     try:
         await sess["browser"].close()
+    except:
+        pass
+    try:
         await sess["pw"].stop()
     except:
         pass
+    log.info(f"🛑 bc_close: браузер закрыт для chat={chat_id}")
 
 
 async def bc_do_ai_action(chat_id: int, instruction: str):
