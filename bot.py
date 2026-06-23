@@ -2620,7 +2620,7 @@ async def main():
     telegram_app.add_handler(CallbackQueryHandler(on_button))
     # Спочатку browser_control_mode — потім звичайний handle_text
     telegram_app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.ALL,
+        filters.TEXT & ~filters.COMMAND,
         _route_text
     ))
 
